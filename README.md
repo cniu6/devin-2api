@@ -275,7 +275,7 @@ Visit `http://localhost:8080/panel` after starting:
 - Auth headers are accepted as both `Authorization: Bearer <key>` and `X-Api-Key: <key>`;
 - Sensitive fields such as tokens are redacted as `<redacted>` in debug logs;
 - Images must be base64 data URLs; external URLs, `file_id`, and local file paths are not supported;
-- Each request must still carry the full message history; `previous_response_id` is accepted but currently does not enable server-side state retention;
+- Each request may carry the full message history (fully supported and recommended); when a request carries only the new turn plus a `previous_response_id` issued by this server, the conversation history is now restored server-side and prepended automatically. An unknown or expired id never fails the request -- it degrades to the single-turn behaviour and is recorded in the debug log;
 - `config.yaml` is in `.gitignore`; even though the example is tracked, never commit a real token;
 - Request body size is capped at 32 MiB to accommodate multi-image base64 payloads.
 

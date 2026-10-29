@@ -21,6 +21,8 @@ import (
 	"github.com/leookun/devin-2api/internal/config"
 	"github.com/leookun/devin-2api/internal/debuglog"
 	"github.com/leookun/devin-2api/internal/llm"
+	"github.com/leookun/devin-2api/internal/responsestore"
+	respproto "github.com/leookun/devin-2api/internal/api/openai/responses"
 )
 
 // DashboardRegistrar 描述面板路由注册所需的最小能力。
@@ -58,6 +60,8 @@ type App struct {
 	apiKey string
 	// concurrency 限制同时处理的 /v1/* 请求数。
 	concurrency chan struct{}
+	// responses 保存 Responses API 的服务端会话，供 previous_response_id 补齐历史。
+	responses *responsestore.Store
 }
 
 // New 创建一个使用指定供应商适配器的 HTTP 应用。
@@ -71,6 +75,7 @@ func New(providerAdapter adapter.Adapter, serverConfig config.ServerConfig, debu
 		serverConfig: serverConfig,
 		debugManager: debugManager,
 		concurrency:  make(chan struct{}, limit),
+		responses:    responsestore.New(0, 0),
 	}
 }
 
@@ -299,6 +304,37 @@ func (application *App) createCompletion(
 	}
 	completion.Model = messages.Model
 	completion.Stream = options.Stream
+	// previous_response_id 只有 Responses 协议会填；其余协议该字段恒为空，
+	// WithHistory 原样返回，行为与改造前一致。
+	//
+	// 解析不到 / 客户端已带完整历史都不打断请求（兼容性优先，见 WithHistory 注释），
+	// 但要把结果写成可观测事实，而不是退回"每轮盲答且无人知道"。
+	if options.PreviousResponseID != "" {
+		caller := application.apiKey
+		if caller == "" {
+			caller = "default"
+		}
+		merged, resolution, historyErr := respproto.WithHistory(messages, options.PreviousResponseID, caller, application.responses.Get)
+		if historyErr != nil {
+			completion.StatusCode = http.StatusBadRequest
+			writeLoggedError(writer, recorder, "previous_response_id", completion.StatusCode, historyErr)
+			return
+		}
+		messages = merged
+		switch {
+		case resolution.Injected:
+			recorder.WriteJSON("02b-history-injected.json", map[string]any{
+				"previous_response_id": options.PreviousResponseID,
+				"history_messages":     resolution.HistoryCount,
+			})
+		case resolution.ClientSuppliedFullHistory:
+		case resolution.UnknownID:
+			recorder.WriteJSON("02b-history-unresolved.json", map[string]any{
+				"previous_response_id": options.PreviousResponseID,
+				"reason":               "unknown, expired, or owned by another caller",
+			})
+		}
+	}
 	recorder.WriteJSON("02-request-messages.json", debuglog.RequestMessagesProjection(messages))
 	ctx := debuglog.WithRecorder(request.Context(), recorder)
 	stream, err := application.adapter.Stream(ctx, messages)
@@ -323,7 +359,7 @@ func (application *App) createCompletion(
 		}
 
 		completion.StatusCode = http.StatusOK
-		message, streamErr := writeProtocolStream(ctx, writer, stream, recorder, protocol, messages.Model, options, firstEvent, err)
+		message, encoder, streamErr := writeProtocolStream(ctx, writer, stream, recorder, protocol, messages.Model, options, firstEvent, err)
 		updateCompletionIdentity(&completion, message)
 		if streamErr != nil {
 			if errors.Is(streamErr, context.Canceled) || errors.Is(streamErr, context.DeadlineExceeded) {
@@ -335,6 +371,7 @@ func (application *App) createCompletion(
 			return
 		}
 		completion.Result = "completed"
+		application.rememberStreamExchange(messages, message, encoder)
 		return
 	}
 	message, err := collectFinalMessage(ctx, stream, recorder)
@@ -359,6 +396,37 @@ func (application *App) createCompletion(
 	recorder.AppendJSONL("06-http-response.jsonl", "response", json.RawMessage(body))
 	completion.StatusCode = http.StatusOK
 	completion.Result = "completed"
+	application.rememberResponsesExchange(messages, message, body)
+}
+
+// rememberResponsesExchange 用「客户端实际收到的那个响应 id」作为键保存会话。
+//
+// 为什么不能直接用 reply.ResponseID：协议层（responses.EncodeResponse）在
+// ResponseID 不以 "resp_" 开头时会本地另生成一个返回给客户端。若这里按
+// reply.ResponseID 存，客户端下一轮回传的是生成值，必然查不到。
+// 因此从编码后的响应体里读回 id，保证两侧落到同一个键上。
+func (application *App) rememberResponsesExchange(
+	requestMessages llm.RequestMessages,
+	reply *llm.AssistantMessage,
+	encoded []byte,
+) {
+	if application.responses == nil || reply == nil || len(encoded) == 0 {
+		return
+	}
+	var projection struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(encoded, &projection); err != nil || projection.ID == "" {
+		return
+	}
+	caller := application.apiKey
+	if caller == "" {
+		caller = "default"
+	}
+	history := make([]llm.Message, 0, len(requestMessages.Messages)+1)
+	history = append(history, requestMessages.Messages...)
+	history = append(history, *reply)
+	application.responses.PutWithID(caller, projection.ID, history)
 }
 
 func writeProtocolStream(
@@ -371,10 +439,10 @@ func writeProtocolStream(
 	options protocolOptions,
 	firstEvent llm.ResponseEvent,
 	firstErr error,
-) (*llm.AssistantMessage, error) {
+) (*llm.AssistantMessage, streamEncoder, error) {
 	flusher, ok := writer.(http.Flusher)
 	if !ok {
-		return nil, errors.New("streaming response writer does not support flushing")
+		return nil, nil, errors.New("streaming response writer does not support flushing")
 	}
 	writer.Header().Set("Content-Type", "text/event-stream")
 	writer.Header().Set("Cache-Control", "no-cache")
@@ -384,19 +452,19 @@ func writeProtocolStream(
 	event, err := firstEvent, firstErr
 	for {
 		if errors.Is(err, io.EOF) {
-			return latest, nil
+			return latest, encoder, nil
 		}
 		if err != nil {
-			return latest, err
+			return latest, encoder, err
 		}
 		latest = eventMessage(event, latest)
 		encodedEvents, encodeErr := encoder.Encode(event)
 		if encodeErr != nil {
-			return latest, encodeErr
+			return latest, encoder, encodeErr
 		}
 		for _, encoded := range encodedEvents {
 			if _, wErr := writer.Write(protocol.SSEFormat(encoded.Name, encoded.Data)); wErr != nil {
-				return latest, wErr
+				return latest, encoder, wErr
 			}
 			if encoded.Name == "[DONE]" {
 				recorder.AppendJSONL("06-http-response.jsonl", encoded.Name, string(encoded.Data))
@@ -408,9 +476,9 @@ func writeProtocolStream(
 		if event.Type == llm.ResponseEventError {
 			// 错误 SSE 已在上面循环写出，这里直接返回错误供外层记录失败日志。
 			if event.Error != nil && event.Error.ErrorMessage != "" {
-				return latest, errors.New(event.Error.ErrorMessage)
+				return latest, encoder, errors.New(event.Error.ErrorMessage)
 			}
-			return latest, errors.New("response stream returned an error event")
+			return latest, encoder, errors.New("response stream returned an error event")
 		}
 		event, err = receiveEvent(ctx, stream, recorder)
 	}
@@ -551,4 +619,40 @@ func mapProviderErrorStatus(err error) int {
 	default:
 		return http.StatusBadGateway
 	}
+}
+
+// streamIDProvider 由能自报响应 id 的流式编码器实现（目前只有 Responses）。
+type streamIDProvider interface {
+	ResponseID() string
+}
+
+// rememberStreamExchange 保存一次流式 Responses 会话。
+//
+// 流式响应公布的 id 由 StreamEncoder 在构造时生成，与 message.ResponseID 无关，
+// 事后无法从上游字段反推；因此必须从编码器取回**客户端真正看到的那个 id**，
+// 否则存下的键永远无法被下一轮 previous_response_id 命中。
+func (application *App) rememberStreamExchange(
+	requestMessages llm.RequestMessages,
+	reply *llm.AssistantMessage,
+	encoder streamEncoder,
+) {
+	if application.responses == nil || reply == nil || encoder == nil {
+		return
+	}
+	provider, ok := encoder.(streamIDProvider)
+	if !ok {
+		return
+	}
+	responseID := provider.ResponseID()
+	if responseID == "" {
+		return
+	}
+	caller := application.apiKey
+	if caller == "" {
+		caller = "default"
+	}
+	history := make([]llm.Message, 0, len(requestMessages.Messages)+1)
+	history = append(history, requestMessages.Messages...)
+	history = append(history, *reply)
+	application.responses.PutWithID(caller, responseID, history)
 }
