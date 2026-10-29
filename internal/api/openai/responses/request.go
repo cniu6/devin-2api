@@ -32,6 +32,9 @@ type Request struct {
 	Temperature *float64 `json:"temperature,omitempty"`
 	// PreviousResponseID 是上游 Responses 会话关联标识。
 	PreviousResponseID string `json:"previous_response_id,omitempty"`
+	// Store 控制服务端是否保留本次响应供后续 previous_response_id 引用。
+	// 用指针区分“未提供”与“显式 false”：OpenAI 的默认值是 true。
+	Store *bool `json:"store,omitempty"`
 }
 
 // Tool 是 OpenAI Responses function 工具定义。
@@ -64,6 +67,8 @@ type RequestOptions struct {
 	Temperature *float64
 	// PreviousResponseID 是调用方提供的上游响应关联标识。
 	PreviousResponseID string
+	// Store 表示调用方是否希望服务端保留本次响应（OpenAI 默认 true）。
+	Store bool
 }
 
 // DecodeRequest 将 OpenAI Responses JSON 请求转换为中间请求。
@@ -105,6 +110,8 @@ func DecodeRequest(data []byte) (AdaptedRequest, error) {
 			MaxOutputTokens:    request.MaxOutputTokens,
 			Temperature:        request.Temperature,
 			PreviousResponseID: request.PreviousResponseID,
+			// 未提供 store 时按 OpenAI 契约取 true。
+			Store: request.Store == nil || *request.Store,
 		},
 	}, nil
 }

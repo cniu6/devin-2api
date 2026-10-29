@@ -35,6 +35,8 @@ type eventWire struct {
 type protocolOptions struct {
 	Stream       bool
 	IncludeUsage bool
+	// Store 只有 Responses 协议会填：false 表示调用方拒绝服务端保留会话。
+	Store bool
 }
 
 // responsesProtocol 实现 OpenAI Responses API 协议。
@@ -46,6 +48,18 @@ func (p responsesProtocol) NewStreamEncoder(model string, _ bool) streamEncoder 
 
 func (p responsesProtocol) EncodeFinal(message *llm.AssistantMessage) ([]byte, error) {
 	return responses.EncodeResponse(message)
+}
+
+// EncodeFinalWithStore 编码非流式响应，并如实回显 store。
+func (p responsesProtocol) EncodeFinalWithStore(message *llm.AssistantMessage, store bool) ([]byte, error) {
+	return responses.EncodeResponse(message, store)
+}
+
+// NewResponsesStreamEncoder 创建流式编码器，并把真实的 store 值传给它。
+func NewResponsesStreamEncoder(model string, store bool) streamEncoder {
+	encoder := responses.NewStreamEncoder(model)
+	encoder.SetStore(store)
+	return &responsesStreamAdapter{encoder}
 }
 
 func (p responsesProtocol) SSEFormat(name string, data []byte) []byte {
@@ -139,6 +153,9 @@ func decodeResponsesRequest(data []byte) (llm.RequestMessages, protocolOptions, 
 	return adapted.Context, protocolOptions{
 		Stream:       adapted.Options.Stream,
 		IncludeUsage: false,
+		// 这是 store 从解码层走进 handler 的唯一通路；丢掉它会让
+		// 调用方的 store:false 被静默忽略。
+		Store: adapted.Options.Store,
 	}, nil
 }
 

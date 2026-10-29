@@ -344,7 +344,7 @@ func (application *App) createCompletion(
 		return
 	}
 	updateCompletionIdentity(&completion, message)
-	body, err = protocol.EncodeFinal(message)
+	body, err = encodeFinalWithStore(protocol, message, options.Store)
 	if err != nil {
 		completion.StatusCode = http.StatusInternalServerError
 		writeLoggedError(writer, recorder, "http_encode", completion.StatusCode, err)
@@ -379,7 +379,7 @@ func writeProtocolStream(
 	writer.Header().Set("Content-Type", "text/event-stream")
 	writer.Header().Set("Cache-Control", "no-cache")
 	writer.Header().Set("Connection", "keep-alive")
-	encoder := protocol.NewStreamEncoder(model, options.IncludeUsage)
+	encoder := newStreamEncoderWithStore(protocol, model, options)
 	var latest *llm.AssistantMessage
 	event, err := firstEvent, firstErr
 	for {
@@ -551,4 +551,30 @@ func mapProviderErrorStatus(err error) int {
 	default:
 		return http.StatusBadGateway
 	}
+}
+
+// encodeFinalWithStore 编码非流式响应。
+// Responses 协议的 store 字段必须如实反映服务端行为：恒定 true 会让写了
+// store:false 的调用方以为会话被保留，而事实上它并没有。
+func encodeFinalWithStore(
+	protocol protocolEncoder,
+	message *llm.AssistantMessage,
+	store bool,
+) ([]byte, error) {
+	if responds, ok := protocol.(responsesProtocol); ok {
+		return responds.EncodeFinalWithStore(message, store)
+	}
+	return protocol.EncodeFinal(message)
+}
+
+// newStreamEncoderWithStore 创建流式编码器，并把真实的 store 值交给 Responses 编码器。
+func newStreamEncoderWithStore(
+	protocol protocolEncoder,
+	model string,
+	options protocolOptions,
+) streamEncoder {
+	if _, ok := protocol.(responsesProtocol); ok {
+		return NewResponsesStreamEncoder(model, options.Store)
+	}
+	return protocol.NewStreamEncoder(model, options.IncludeUsage)
 }

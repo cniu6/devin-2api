@@ -39,6 +39,8 @@ type StreamEncoder struct {
 	started bool
 	// completed 表示终止事件已经发出。
 	completed bool
+	// store 记录本次响应是否会被服务端保留，用于在响应体里如实回显。
+	store bool
 }
 
 // streamItem 保存一个 reasoning、function_call 或 message output item 的编码状态。
@@ -70,11 +72,19 @@ func NewStreamEncoder(model string) *StreamEncoder {
 		responseID: newResponseID("resp"),
 		createdAt:  time.Now().Unix(),
 		items:      make(map[int]*streamItem),
+		store:      true,
 	}
 }
 
+// SetStore 记录本次响应是否真的会被服务端保留，使响应体的 store 字段如实回显。
+// 恒定回显 true 会在调用方写了 store:false 时给出与实际行为相反的答案。
+func (encoder *StreamEncoder) SetStore(store bool) {
+	encoder.store = store
+}
+
 // EncodeResponse 将最终助手消息编码为非流式 Responses JSON 响应。
-func EncodeResponse(message *llm.AssistantMessage) ([]byte, error) {
+// store 为可选参数：不传时按 true 回显，保持既有调用点语义不变。
+func EncodeResponse(message *llm.AssistantMessage, store ...bool) ([]byte, error) {
 	if message == nil {
 		return nil, fmt.Errorf("response message is nil")
 	}
@@ -95,7 +105,11 @@ func EncodeResponse(message *llm.AssistantMessage) ([]byte, error) {
 		createdAt = time.Now().Unix()
 	}
 	status := responseStatus(message.StopReason)
-	response := baseResponse(responseID, model, createdAt, status)
+	storeValue := true
+	if len(store) > 0 {
+		storeValue = store[0]
+	}
+	response := baseResponse(responseID, model, createdAt, status, storeValue)
 	if status == "completed" {
 		response["completed_at"] = time.Now().Unix()
 	}
@@ -147,7 +161,7 @@ func (encoder *StreamEncoder) start() []SSEEvent {
 		return nil
 	}
 	encoder.started = true
-	created := baseResponse(encoder.responseID, encoder.model, encoder.createdAt, "in_progress")
+	created := baseResponse(encoder.responseID, encoder.model, encoder.createdAt, "in_progress", encoder.store)
 	return []SSEEvent{
 		encoder.emit("response.created", map[string]any{"response": created}),
 		encoder.emit("response.in_progress", map[string]any{"response": created}),
@@ -332,7 +346,7 @@ func (encoder *StreamEncoder) done(event llm.ResponseEvent) ([]SSEEvent, error) 
 		}
 	}
 	encoder.completed = true
-	response := baseResponse(encoder.responseID, encoder.model, encoder.createdAt, responseStatus(event.Reason))
+	response := baseResponse(encoder.responseID, encoder.model, encoder.createdAt, responseStatus(event.Reason), encoder.store)
 	response["output"] = encoder.completedOutput()
 	response["usage"] = responseUsage(event.Message.Usage)
 	eventName := "response.completed"
@@ -354,7 +368,7 @@ func (encoder *StreamEncoder) failed(event llm.ResponseEvent) []SSEEvent {
 	// OpenAI Responses API 中，流式失败应发送 response.failed 事件，
 	// 包含 status="failed" 的 response 对象与 error 字段。
 	errorType := common.OpenAIErrorType(message)
-	response := baseResponse(encoder.responseID, encoder.model, encoder.createdAt, "failed")
+	response := baseResponse(encoder.responseID, encoder.model, encoder.createdAt, "failed", encoder.store)
 	response["error"] = map[string]any{"message": message, "type": errorType, "code": nil, "param": nil}
 	return []SSEEvent{encoder.emit("response.failed", map[string]any{
 		"response": response,
@@ -411,13 +425,14 @@ func (encoder *StreamEncoder) emit(name string, payload map[string]any) SSEEvent
 	return SSEEvent{Name: name, Data: data}
 }
 
-func baseResponse(id string, model string, createdAt int64, status string) map[string]any {
-	// 对齐 OpenAI Response 对象的稳定字段；IDE 多轮常依赖 store=true。
+func baseResponse(id string, model string, createdAt int64, status string, store bool) map[string]any {
+	// 对齐 OpenAI Response 对象的稳定字段。store 必须回显真实值：
+	// 恒定输出 true 会让写了 store:false 的调用方以为会话被保留。
 	return map[string]any{
 		"id": id, "object": "response", "created_at": createdAt, "status": status,
 		"error": nil, "incomplete_details": nil, "instructions": nil, "model": model,
 		"output": []any{}, "parallel_tool_calls": true, "previous_response_id": nil,
-		"reasoning": map[string]any{"effort": nil, "summary": nil}, "store": true,
+		"reasoning": map[string]any{"effort": nil, "summary": nil}, "store": store,
 		"temperature": nil, "top_p": nil, "truncation": "disabled",
 		"tool_choice": "auto", "tools": []any{}, "usage": nil, "metadata": map[string]any{},
 		"max_output_tokens": nil, "text": map[string]any{"format": map[string]any{"type": "text"}},
