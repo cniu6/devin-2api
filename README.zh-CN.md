@@ -17,6 +17,42 @@
 - **代理与分流**：默认直连；`devin.proxy` 作为兜底出口；`devin.proxy_pools` 支持任意命名的代理池（池内多地址轮询分摊并发）；`devin.routes` 按模型 uid/标签/系列/分组通配符把不同模型分流到不同池；支持 `http://`、`https://`、`socks5://`、`socks5h://`，可带认证；全部修改后重启生效。
 - **请求级调试日志**：开启 `debug.enabled` 后在 `logs/` 目录下输出每请求的完整链路。
 
+## 工作原理
+
+```mermaid
+flowchart TB
+    subgraph 客户端
+        CC[Claude Code / Z Code]
+        CX[Codex]
+        OAI[OpenAI 兼容工具]
+    end
+
+    CC -->|POST /v1/messages| GATE
+    CX -->|POST /v1/responses| GATE
+    OAI -->|"POST /v1/chat/completions<br/>/v1/audio/transcriptions"| GATE
+
+    subgraph GW["devin-2api"]
+        GATE["API key 鉴权 +<br/>并发闸 max_concurrency"]
+        DEC["协议解码<br/>→ llm.RequestMessages"]
+        ROUTE{"模型分流<br/>devin.routes 通配符"}
+        ADP["Devin 适配层<br/>gRPC-Web"]
+        ENC["协议编码<br/>JSON / SSE / WS"]
+        RSP[("会话存储<br/>previous_response_id")]
+        GATE --> DEC --> ROUTE --> ADP --> ENC
+        DEC -.->|历史注入| RSP
+        ENC -.usage.- STATS[("统计采集<br/>→ stats.json")]
+    end
+
+    ROUTE -->|direct| P1["国内直连出口<br/>低延迟"]
+    ROUTE -->|命名代理池| P2["代理池<br/>池内轮询"]
+    ROUTE -->|default| P3["devin.proxy<br/>兜底"]
+    P1 & P2 & P3 --> UP[("server.codeium.com")]
+
+    PANEL["/panel 管理面板<br/>模型·配额·促销·统计"] -.读取.- STATS
+```
+
+上游按出口地区返回不同模型目录（直连约 50 个 vs 美国出口约 300 个），因此按模型分流：延迟敏感的常用模型走直连，区域限定模型走命名代理池。
+
 ## 快速开始
 
 ### 1. 获取 Devin token
@@ -277,6 +313,8 @@ auth:
 ## 管理面板
 
 面板默认关闭（`dashboard.enabled` 未设置或 `false` 时 `/panel` 返回 404）。开启后访问 `http://localhost:8080/panel`：
+
+![Devin·2API 管理面板 — 模型页](docs/dashboard.png)
 
 - `dashboard.enabled: true` 启用面板；需 `devin.token` 已配置，否则面板不启用（启动日志有提示）；
 - `dashboard.password` 三种模式：

@@ -17,6 +17,42 @@
 - **Proxy & routing**: direct by default; `devin.proxy` is the fallback egress; `devin.proxy_pools` defines arbitrarily named pools (multiple addresses per pool, per-request round-robin to spread concurrency); `devin.routes` maps models to pools via uid/label/family/group wildcards; `http://`, `https://`, `socks5://`, `socks5h://` with optional auth; all changes take effect on restart.
 - **Request-level debug logs**: enable with `debug.enabled`; logs each request lifecycle under `logs/`.
 
+## How it works
+
+```mermaid
+flowchart TB
+    subgraph Clients
+        CC[Claude Code / Z Code]
+        CX[Codex]
+        OAI[OpenAI-compatible tools]
+    end
+
+    CC -->|POST /v1/messages| GATE
+    CX -->|POST /v1/responses| GATE
+    OAI -->|"POST /v1/chat/completions<br/>/v1/audio/transcriptions"| GATE
+
+    subgraph GW["devin-2api"]
+        GATE["API key auth +<br/>concurrency gate"]
+        DEC["protocol decode<br/>→ llm.RequestMessages"]
+        ROUTE{"model route<br/>devin.routes wildcards"}
+        ADP["Devin adapter<br/>gRPC-Web"]
+        ENC["protocol encode<br/>JSON / SSE / WS"]
+        RSP[("response store<br/>previous_response_id")]
+        GATE --> DEC --> ROUTE --> ADP --> ENC
+        DEC -.->|history inject| RSP
+        ENC -.usage.- STATS[("stats collector<br/>→ stats.json")]
+    end
+
+    ROUTE -->|direct| P1["domestic egress<br/>low latency"]
+    ROUTE -->|named pool| P2["proxy pool<br/>round-robin"]
+    ROUTE -->|default| P3["devin.proxy<br/>fallback"]
+    P1 & P2 & P3 --> UP[("server.codeium.com")]
+
+    PANEL["/panel dashboard<br/>models · quotas · promos · stats"] -.read.- STATS
+```
+
+The upstream catalog differs by egress region (~50 models direct vs ~300 via a US egress), so models are routed per-request: latency-sensitive models go direct, region-locked models go through named proxy pools.
+
 ## Quick start
 
 ### 1. Get a Devin token
@@ -277,6 +313,8 @@ auth:
 ## Dashboard
 
 The dashboard is off by default (`/panel` returns 404 unless `dashboard.enabled: true`). Once enabled, visit `http://localhost:8080/panel`:
+
+![Devin·2API dashboard — models page](docs/dashboard.png)
 
 - `dashboard.enabled: true` turns it on; it requires `devin.token` to fetch model catalog, groups, and usage — otherwise it stays disabled (a hint is logged at startup);
 - `dashboard.password` has three modes:
