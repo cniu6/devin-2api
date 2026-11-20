@@ -245,7 +245,7 @@ tr.fam:hover td{background:#171e30}
 <span class="chip" data-tag="fast" onclick="toggleChip(this)">FAST</span>
 <span class="chip" data-tag="premium" onclick="toggleChip(this)">Premium</span>
 <span class="chip" data-tag="rec" onclick="toggleChip(this)">推荐</span>
-<span class="chip" data-tag="empty_mult" onclick="toggleChip(this)">无倍率(FREE/基准)</span>
+<span class="chip" data-tag="empty_mult" onclick="toggleChip(this)">0/无倍率(免费)</span>
 <span class="chip" data-tag="disabled" onclick="toggleChip(this)">已禁用</span>
 </div>
 <div class="stats" id="stats">加载中...</div>
@@ -272,7 +272,7 @@ tr.fam:hover td{background:#171e30}
 </div>
 <div class="note">
 <strong>价格说明：</strong>
-<code>倍率</code> 是每请求消耗 credit 数，FREE 为 0，未下发按基准 ≈1 计。
+<code>倍率</code> 是每请求消耗 credit 数；FREE 是上游定价等级名（≠0 消耗，如 SWE-2 free 仍按 x4~x12 计），倍率 0 才在最终价格显示"免费"，未下发按基准 ≈1 计。
 <code>Input / Cached / Output</code> 为上游 <code>model_dimensions</code> 下发的 $/1M tokens 参考价。
 <code>最终价格</code> = 每请求倍率 + 进出价合并区间（含 effort 低~高浮动）。
 <code>分类</code> 来自上游 picker 分组（client_model_sorts）与模型系列；促销模型名称旁的 🎁 悬浮显示优惠详情。
@@ -596,7 +596,7 @@ return h;
 
 function matchTags(m){
 for(const t of activeTags){
-if(t==='free' && !(m.cost_tier==='free'&&(!m.credit_multiplier||m.credit_multiplier===0))) return false;
+if(t==='free' && m.cost_tier!=='free') return false;
 if(t==='promo' && !(m.promo&&m.promo.active)) return false;
 if(t==='img' && !m.supports_images) return false;
 if(t==='beta' && !m.is_beta) return false;
