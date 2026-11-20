@@ -42,9 +42,22 @@ type Config struct {
 	// Model 是 Devin chat model UID。
 	Model string
 	// Proxy 是可选的 HTTP/HTTPS/SOCKS5 代理地址；为空时直连或走系统环境变量。
+	// 也是分流未命中时的兜底出口。
 	Proxy string
+	// ProxyPools 是动态命名的代理池：池内多个地址按请求轮询分摊；
+	// 配合 Routes 把不同模型/分组引到不同出口。
+	ProxyPools map[string][]string
+	// Routes 是模型分流规则：按 uid/标签/系列/分组通配符顺序匹配，命中即止。
+	Routes []httpproxy.Route
 	// ForceHTTP1 为 true 时强制 HTTP/1.1，每请求独立连接，避免 HTTP/2 单连接多 stream 并发瓶颈。
 	ForceHTTP1 bool
+}
+
+// modelMeta 是模型目录中用于分流匹配的附加标识。
+type modelMeta struct {
+	label  string
+	family string
+	groups []string
 }
 
 // Adapter 调用 Devin 的 ApiServerService/GetChatMessage。
@@ -52,8 +65,11 @@ type Adapter struct {
 	config         Config
 	client         devinprotoconnect.ApiServerServiceClient
 	apiClient      devinprotoconnect.ApiServerServiceClient
+	base           http.RoundTripper
+	router         *httpproxy.Router
 	modelsMu       sync.RWMutex
 	models         []adapter.ModelInfo
+	modelMeta      map[string]modelMeta
 	modelsExpiry   time.Time
 	modelsCacheTTL time.Duration
 }
@@ -86,12 +102,22 @@ func New(config Config) (*Adapter, error) {
 	apiHTTPClient := &http.Client{Transport: transport, Timeout: 610 * time.Second}
 	apiClient := devinprotoconnect.NewApiServerServiceClient(apiHTTPClient, config.BaseURL)
 
-	return &Adapter{
+	a := &Adapter{
 		config:         config,
 		client:         streamClient,
 		apiClient:      apiClient,
+		base:           base,
 		modelsCacheTTL: 5 * time.Minute,
-	}, nil
+	}
+	// 配置了代理池或分流规则时构建路由器；非法配置在启动时直接报错。
+	if len(config.ProxyPools) > 0 || len(config.Routes) > 0 {
+		router, err := httpproxy.NewRouter(config.ProxyPools, config.Routes, base, config.ForceHTTP1)
+		if err != nil {
+			return nil, fmt.Errorf("proxy routing: %w", err)
+		}
+		a.router = router
+	}
+	return a, nil
 }
 
 // Stream 将一份中间请求转换为 Devin RPC，并返回一份中间响应事件流。
@@ -114,7 +140,7 @@ func (adapter *Adapter) Stream(ctx context.Context, request llm.RequestMessages)
 	}
 	recorder := debuglog.FromContext(ctx)
 	recordProtoJSON(recorder, "03-devin-request.json", protoRequest)
-	stream, err := adapter.client.GetChatMessage(ctx, connect.NewRequest(protoRequest))
+	stream, err := adapter.streamClientFor(ctx, model).GetChatMessage(ctx, connect.NewRequest(protoRequest))
 	if err != nil {
 		recorder.WriteError("devin_connect", err)
 		// 透传上游 Connect 错误原文，不包一层模糊前缀。
@@ -192,57 +218,138 @@ func connectError(err error) error {
 	return err
 }
 
+// streamClientFor 按分流规则为本次请求选择 stream client；
+// 未命中或命中 fallback 时复用启动时构建的默认 client，避免每请求重建 Transport。
+func (a *Adapter) streamClientFor(ctx context.Context, model string) devinprotoconnect.ApiServerServiceClient {
+	if a.router == nil {
+		return a.client
+	}
+	transport := a.router.TransportFor(a.routeIDs(ctx, model)...)
+	if transport == a.base {
+		return a.client
+	}
+	return devinprotoconnect.NewApiServerServiceClient(&http.Client{Transport: &authTransport{base: transport, token: a.config.Token}}, a.config.BaseURL)
+}
+
+// routeIDs 返回模型用于分流匹配的全部标识：uid + 目录中的 标签/系列/分组。
+func (a *Adapter) routeIDs(ctx context.Context, model string) []string {
+	ids := []string{model}
+	m, ok := a.ensureMeta(ctx)[model]
+	if !ok {
+		return ids
+	}
+	if m.label != "" {
+		ids = append(ids, m.label)
+	}
+	if m.family != "" {
+		ids = append(ids, m.family)
+	}
+	return append(ids, m.groups...)
+}
+
+// ensureMeta 返回 uid→元信息 快照；未缓存时随本次请求拉取（与 ListModels 共享 TTL 缓存）。
+// 拉取失败返回空表，分流退化为仅按 uid 匹配。
+func (a *Adapter) ensureMeta(ctx context.Context) map[string]modelMeta {
+	a.modelsMu.RLock()
+	if a.modelMeta != nil && time.Now().Before(a.modelsExpiry) {
+		meta := a.modelMeta
+		a.modelsMu.RUnlock()
+		return meta
+	}
+	a.modelsMu.RUnlock()
+	if _, _, err := a.catalog(ctx); err != nil {
+		return map[string]modelMeta{}
+	}
+	a.modelsMu.RLock()
+	defer a.modelsMu.RUnlock()
+	if a.modelMeta == nil {
+		return map[string]modelMeta{}
+	}
+	return a.modelMeta
+}
+
 // ListModels 通过 GetCascadeModelConfigs 拉取可用模型目录，结果带 TTL 缓存。
 func (a *Adapter) ListModels(ctx context.Context) ([]adapter.ModelInfo, error) {
+	models, _, err := a.catalog(ctx)
+	return models, err
+}
+
+// catalog 拉取模型目录快照：OpenAI 模型列表 + 分流匹配所需的元信息。
+// models 与 meta 同源同 TTL，ListModels 与 routeIDs 共用一份缓存。
+func (a *Adapter) catalog(ctx context.Context) ([]adapter.ModelInfo, map[string]modelMeta, error) {
 	a.modelsMu.RLock()
 	if a.models != nil && time.Now().Before(a.modelsExpiry) {
-		cached := a.models
+		models, meta := a.models, a.modelMeta
 		a.modelsMu.RUnlock()
-		return cached, nil
+		return models, meta, nil
 	}
 	a.modelsMu.RUnlock()
 
 	resp, err := a.apiClient.GetCascadeModelConfigs(ctx, connect.NewRequest(&devinproto.GetCascadeModelConfigsRequest{
-		Metadata: &devinproto.ExaCodeiumCommonPb_Metadata{
-			ApiKey:           proto.String(a.config.Token),
-			ExtensionName:    proto.String(clientName),
-			ExtensionVersion: proto.String(clientVersion),
-			IdeName:          proto.String(clientName),
-			IdeVersion:       proto.String(clientVersion),
-			Locale:           proto.String("en"),
-			Os:               proto.String("win"),
-		},
+		Metadata: a.metadata(),
 	}))
 	if err != nil {
-		return nil, fmt.Errorf("Devin GetCascadeModelConfigs: %w", err)
+		return nil, nil, fmt.Errorf("Devin GetCascadeModelConfigs: %w", err)
 	}
+
+	// 分组索引：picker 分组按 model label 归组，先建 label→组名 映射。
+	labelGroups := map[string][]string{}
+	for _, s := range resp.Msg.GetClientModelSorts() {
+		for _, g := range s.GetGroups() {
+			for _, l := range g.GetModelLabels() {
+				labelGroups[l] = append(labelGroups[l], g.GetGroupName())
+			}
+		}
+	}
+
 	now := time.Now().Unix()
 	models := make([]adapter.ModelInfo, 0, len(resp.Msg.GetClientModelConfigs()))
+	meta := make(map[string]modelMeta, len(resp.Msg.GetClientModelConfigs()))
 	seen := make(map[string]struct{}, len(resp.Msg.GetClientModelConfigs()))
-	for _, c := range resp.Msg.GetClientModelConfigs() {
-		if c.GetDisabled() {
-			continue
-		}
+	add := func(c *devinproto.ExaCodeiumCommonPb_ClientModelConfig) {
 		uid := c.GetModelUid()
 		if uid == "" && c.GetModelOrAlias() != nil {
 			uid = c.GetModelOrAlias().GetModelUid()
 		}
 		if uid == "" {
-			continue
+			return
+		}
+		m := modelMeta{label: c.GetLabel(), groups: labelGroups[c.GetLabel()]}
+		if fm := c.GetModelFamilyMetadata(); fm != nil {
+			m.family = fm.GetModelFamilyLabel()
+		}
+		meta[uid] = m
+		if c.GetDisabled() {
+			return
 		}
 		if _, ok := seen[uid]; ok {
-			continue
+			return
 		}
 		seen[uid] = struct{}{}
 		ownedBy := "devin"
 		if p := c.GetProvider().String(); p != "" {
 			if i := strings.LastIndex(p, "_"); i >= 0 && i+1 < len(p) {
 				ownedBy = strings.ToLower(p[i+1:])
+			} else if p == "13" {
+				// 枚举 13 比抓取的 proto 更新；上游分组名为 Meta（Muse Wonder 系列）。
+				ownedBy = "meta"
 			}
 		}
 		models = append(models, adapter.ModelInfo{
 			ID: uid, Created: now, OwnedBy: ownedBy, SupportsImages: c.GetSupportsImages(),
 		})
+	}
+	for _, c := range resp.Msg.GetClientModelConfigs() {
+		add(c)
+	}
+	// 合并命令模型目录（commit 信息等命令用模型，如 MODEL_PRIVATE_2 "Claude 4.5 Sonnet"）：
+	// 不在 chat picker 中但可直接调用；失败不影响主目录。
+	if cmdResp, err := a.apiClient.GetCommandModelConfigs(ctx, connect.NewRequest(&devinproto.GetCommandModelConfigsRequest{
+		Metadata: a.metadata(),
+	})); err == nil {
+		for _, c := range cmdResp.Msg.GetClientModelConfigs() {
+			add(c)
+		}
 	}
 	// 用户显式配置的 model（如 gpt5.6）即使不在 Devin 返回的列表中，也应可被发现和调用。
 	if configured := strings.TrimSpace(a.config.Model); configured != "" {
@@ -259,11 +366,37 @@ func (a *Adapter) ListModels(ctx context.Context) ([]adapter.ModelInfo, error) {
 	defer a.modelsMu.Unlock()
 	// 请求期间可能有其他请求已写入缓存，避免覆盖更热的数据。
 	if a.models != nil && time.Now().Before(a.modelsExpiry) {
-		return a.models, nil
+		return a.models, a.modelMeta, nil
 	}
 	a.models = models
+	a.modelMeta = meta
 	a.modelsExpiry = time.Now().Add(a.modelsCacheTTL)
-	return models, nil
+	return models, meta, nil
+}
+
+// TranscribeAudio 调上游 GetTranscription 把音频字节转写为文本（whisper 系）。
+func (a *Adapter) TranscribeAudio(ctx context.Context, audio []byte) (string, error) {
+	resp, err := a.apiClient.GetTranscription(ctx, connect.NewRequest(&devinproto.GetTranscriptionRequest{
+		Metadata:  a.metadata(),
+		AudioData: audio,
+	}))
+	if err != nil {
+		return "", connectError(err)
+	}
+	return resp.Msg.GetTranscribedText(), nil
+}
+
+// metadata 构建上游 RPC 通用元信息。
+func (a *Adapter) metadata() *devinproto.ExaCodeiumCommonPb_Metadata {
+	return &devinproto.ExaCodeiumCommonPb_Metadata{
+		ApiKey:           proto.String(a.config.Token),
+		ExtensionName:    proto.String(clientName),
+		ExtensionVersion: proto.String(clientVersion),
+		IdeName:          proto.String(clientName),
+		IdeVersion:       proto.String(clientVersion),
+		Locale:           proto.String("en"),
+		Os:               proto.String("win"),
+	}
 }
 
 type authTransport struct {

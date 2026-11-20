@@ -18,6 +18,7 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/leookun/devin-2api/internal/httpproxy"
+	"github.com/leookun/devin-2api/internal/stats"
 
 	devinproto "local/devinproto"
 	"local/devinproto/devinprotoconnect"
@@ -47,12 +48,20 @@ type Handler struct {
 	// 面板数据缓存：模型目录、供应商列表、模型状态均不经常变化，缓存可显著降低上游压力。
 	cacheMu             sync.RWMutex
 	cacheTTL            time.Duration
-	modelsCache         []map[string]any
-	modelsExpiry        time.Time
+	catalogCache        *modelCatalog
+	catalogExpiry       time.Time
 	providersCache      []map[string]any
 	providersExpiry     time.Time
 	modelStatusesCache  []map[string]any
 	modelStatusesExpiry time.Time
+	// stats 是可选的请求统计采集器。
+	stats *stats.Collector
+}
+
+// modelCatalog 是上游返回的模型目录：模型配置 + 客户端模型分组（分类）。
+type modelCatalog struct {
+	models []map[string]any
+	sorts  []map[string]any
 }
 
 // New 创建面板处理器。password 为空表示开放访问。proxy 为可选代理地址。
@@ -87,6 +96,24 @@ func (h *Handler) Register(mux interface {
 	mux.Post("/panel/login", h.handleLogin)
 	mux.Get("/panel/api/status", h.apiStatus)
 	mux.Get("/panel/api/models", h.apiModels)
+	mux.Get("/panel/api/stats", h.apiStats)
+}
+
+// SetStats 注入请求统计采集器；nil 时 /panel/api/stats 返回空统计。
+func (h *Handler) SetStats(collector *stats.Collector) {
+	h.stats = collector
+}
+
+func (h *Handler) apiStats(w http.ResponseWriter, r *http.Request) {
+	if !h.requireAuth(w, r) {
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if h.stats == nil {
+		_ = json.NewEncoder(w).Encode(stats.Snapshot{})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(h.stats.Snapshot())
 }
 
 func (h *Handler) servePanel(w http.ResponseWriter, r *http.Request) {
@@ -166,7 +193,7 @@ func (h *Handler) apiStatus(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 610*time.Second)
 	defer cancel()
 
-	result := map[string]any{}
+	result := map[string]any{"upstream": h.baseURL}
 	var resultMu sync.Mutex
 
 	// 正确路径：JSON Connect SeatManagement GetUserStatus（Bearer + metadata.api_key）
@@ -394,7 +421,7 @@ func (h *Handler) apiModels(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 610*time.Second)
 	defer cancel()
 
-	models, err := h.cachedModels(ctx)
+	catalog, err := h.cachedCatalog(ctx)
 	if err != nil {
 		w.WriteHeader(http.StatusBadGateway)
 		fmt.Fprintf(w, `{"error":"%s"}`, err.Error())
@@ -402,13 +429,13 @@ func (h *Handler) apiModels(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"models": models})
+	_ = json.NewEncoder(w).Encode(map[string]any{"models": catalog.models, "model_sorts": catalog.sorts})
 }
 
-func (h *Handler) cachedModels(ctx context.Context) ([]map[string]any, error) {
+func (h *Handler) cachedCatalog(ctx context.Context) (*modelCatalog, error) {
 	h.cacheMu.RLock()
-	if h.modelsCache != nil && time.Now().Before(h.modelsExpiry) {
-		cached := h.modelsCache
+	if h.catalogCache != nil && time.Now().Before(h.catalogExpiry) {
+		cached := h.catalogCache
 		h.cacheMu.RUnlock()
 		return cached, nil
 	}
@@ -422,7 +449,8 @@ func (h *Handler) cachedModels(ctx context.Context) ([]map[string]any, error) {
 	}
 
 	var models []map[string]any
-	for _, c := range resp.Msg.GetClientModelConfigs() {
+	seen := make(map[string]bool)
+	buildEntry := func(c *devinproto.ExaCodeiumCommonPb_ClientModelConfig, command bool) map[string]any {
 		uid := c.GetModelUid()
 		if uid == "" && c.GetModelOrAlias() != nil {
 			uid = c.GetModelOrAlias().GetModelUid()
@@ -444,6 +472,19 @@ func (h *Handler) cachedModels(ctx context.Context) ([]map[string]any, error) {
 		pricingType := shortEnum(c.GetPricingType().String(), "MODEL_PRICING_TYPE_")
 		provider := shortEnum(c.GetProvider().String(), "MODEL_PROVIDER_")
 		apiProvider := shortEnum(c.GetApiProvider().String(), "API_PROVIDER_")
+		if pricingType == "UNSPECIFIED" {
+			pricingType = ""
+		}
+		if provider == "UNSPECIFIED" {
+			provider = ""
+		}
+		if provider == "13" {
+			// 枚举 13 比抓取的 proto 更新；上游分组名为 Meta（Muse Wonder 系列）。
+			provider = "META"
+		}
+		if apiProvider == "UNSPECIFIED" {
+			apiProvider = ""
+		}
 
 		m := map[string]any{
 			"uid":                 uid,
@@ -523,18 +564,63 @@ func (h *Handler) cachedModels(ctx context.Context) ([]map[string]any, error) {
 		if c.GetBetaWarningMessage() != "" {
 			m["beta_warning"] = c.GetBetaWarningMessage()
 		}
-		models = append(models, m)
+		if command {
+			m["is_command"] = true
+		}
+		return m
 	}
+	for _, c := range resp.Msg.GetClientModelConfigs() {
+		if e := buildEntry(c, false); e != nil {
+			if uid, _ := e["uid"].(string); uid != "" {
+				seen[uid] = true
+			}
+			models = append(models, e)
+		}
+	}
+	// 合并命令模型目录（commit 信息等命令用模型，如 MODEL_PRIVATE_2 "Claude 4.5 Sonnet"）：
+	// 不在 picker 中但可直接调用；已在目录中的去重；失败不影响主目录。
+	if cmdResp, err := h.apiClient.GetCommandModelConfigs(ctx, connect.NewRequest(&devinproto.GetCommandModelConfigsRequest{
+		Metadata: buildMetadata(h.token),
+	})); err == nil {
+		for _, c := range cmdResp.Msg.GetClientModelConfigs() {
+			if e := buildEntry(c, true); e != nil {
+				uid, _ := e["uid"].(string)
+				if uid == "" || seen[uid] {
+					continue
+				}
+				seen[uid] = true
+				models = append(models, e)
+			}
+		}
+	}
+
+	// 客户端模型分组（分类）：上游下发的 picker 分组结构，面板用它做模型分类列/筛选。
+	var sorts []map[string]any
+	for _, s := range resp.Msg.GetClientModelSorts() {
+		var groups []map[string]any
+		for _, g := range s.GetGroups() {
+			groups = append(groups, map[string]any{
+				"name":         g.GetGroupName(),
+				"model_labels": g.GetModelLabels(),
+			})
+		}
+		sorts = append(sorts, map[string]any{
+			"name":           s.GetName(),
+			"display_metric": s.GetDisplayMetric(),
+			"groups":         groups,
+		})
+	}
+	catalog := &modelCatalog{models: models, sorts: sorts}
 
 	h.cacheMu.Lock()
 	defer h.cacheMu.Unlock()
 	// 请求期间可能有其他 goroutine 已写入缓存，不覆盖更热数据。
-	if h.modelsCache != nil && time.Now().Before(h.modelsExpiry) {
-		return h.modelsCache, nil
+	if h.catalogCache != nil && time.Now().Before(h.catalogExpiry) {
+		return h.catalogCache, nil
 	}
-	h.modelsCache = models
-	h.modelsExpiry = time.Now().Add(h.cacheTTL)
-	return models, nil
+	h.catalogCache = catalog
+	h.catalogExpiry = time.Now().Add(h.cacheTTL)
+	return catalog, nil
 }
 
 func buildMetadata(token string) *devinproto.ExaCodeiumCommonPb_Metadata {

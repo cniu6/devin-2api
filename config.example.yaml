@@ -6,21 +6,59 @@ server:
 debug:
   enabled: false
 
+# 请求统计（无配置项，始终开启）：内存聚合请求数/token 用量，每 5 分钟
+# 落盘到本文件同目录 stats.json（存在即合并续计），退出时再保存一次；
+# /panel「统计」页签可视化展示，最近请求详情（头/体/响应）仅内存不落盘。
+
 devin:
   base_url: "https://server.codeium.com"
   token: "devin-session-token$mock-token"
   # model: "swe-1-7"
   model: "glm-5-2"
-  # 代理地址（可选）；支持 http://、https://、socks5://、socks5h://
-  # 留空则直连或走系统环境变量 HTTP_PROXY/HTTPS_PROXY。
-  # proxy: "socks5://127.0.0.1:1080"
+  # 上游代理（可选）：对话兜底出口 + 面板/模型目录出口，修改后重启生效。
+  # 支持 http://、https://、socks5://、socks5h://，可带认证：
+  #   proxy: "http://user:pass@127.0.0.1:7890"
+  #   proxy: "socks5://user:pass@us1.example.com:1080"
+  # 留空则直连，或走系统环境变量 HTTP_PROXY / HTTPS_PROXY。
+  # 注意：模型目录按出口地区下发（美区代理约 300 个模型，直连约 50 个），
+  # 想用全量目录请把美区代理放这里；再用 routes 把低延迟需求模型拉回直连。
+  # proxy: "socks5://user:pass@us1.example.com:1080"
+  #
+  # 代理池（可选）：动态命名，每池可放多个代理地址，池内按请求轮询分摊，
+  # 避免高并发打满单个代理。池名任意起（如 us / hk / home），但
+  # "direct"（直连）和 "default"（= 上面的 devin.proxy 兜底）为保留名。
+  # proxy_pools:
+  #   us:                                    # 美区出口池（多入口轮询）
+  #     - "socks5://user:pass@us1.example.com:1080"
+  #     - "socks5://user:pass@us2.example.com:1080"
+  #
+  # 分流规则（可选）：从上到下匹配，命中即止；未命中走 devin.proxy（留空直连）。
+  # models 里每条模式可匹配：模型 uid / 显示名 / 系列(family) / 分类(上游分组名)，
+  # 支持 * 任意串、? 单字符通配，忽略大小写。pool 填 proxy_pools 中的名字，
+  # 或保留名 direct / default。
+  # 典型用法：proxy=美区代理拉全量目录 → 国内可用模型分流回直连，美区专属
+  # 模型（claude-*、gpt-*、gemini-*、grok-*、muse-*）自然落入美区兜底：
+  # routes:
+  #   - models: ["swe-*", "glm-*", "kimi-*", "deepseek-*", "nemotron-*", "qwen-*", "minimax-*"]
+  #     pool: direct                          # 常用模型直连，低延迟
+  # 反向用法：proxy 留空（目录仅国内可见）→ 指定模型显式走美区：
+  # routes:
+  #   - models: ["claude-*", "gpt-*", "gemini-*", "grok-*", "muse-*"]
+  #     pool: us
   # 强制 HTTP/1.1：每请求独立 TCP 连接，避免 HTTP/2 单连接多 stream 复用
   # 被上游串行处理导致并发卡住/首字延迟飙升。默认 true。
   # 如上游不支持 HTTP/1.1 流式可设 false 回到 HTTP/2。
   force_http1: true
 
 dashboard:
-  # 管理面板密码；留空则无需登录，直接进入 /panel。
+  # 是否启用 /panel 管理面板；默认 false（关闭），需显式开启。
+  # 面板依赖 devin.token 拉取上游模型/用量数据，token 为空时不启用。
+  enabled: true
+  # 面板访问密码：
+  #   留空          → 每次启动自动生成随机密码，打印在启动日志中；
+  #   "none"        → 免密开放（仅限可信本机/内网环境）；
+  #   其他任意字符串 → 固定密码。
+  # 登录会话 cookie 有效期 24 小时。
   password: ""
 
 auth:

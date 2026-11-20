@@ -28,3 +28,10 @@ type Adapter interface {
 	// ListModels 返回当前账号可用的模型目录；失败时返回错误。
 	ListModels(context.Context) ([]ModelInfo, error)
 }
+
+// AudioTranscriber 是可选能力：实现它的适配器可把音频字节转写为文本，
+// 供 /v1/audio/transcriptions 使用；未实现的适配器返回 503。
+type AudioTranscriber interface {
+	// TranscribeAudio 把完整音频字节流（wav/mp3/m4a 等）转写为文本。
+	TranscribeAudio(context.Context, []byte) (string, error)
+}

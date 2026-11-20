@@ -6,15 +6,15 @@
 
 ## 特性
 
-- **多协议兼容**：`POST /v1/responses`、`POST /v1/chat/completions`、`POST /v1/messages`，以及对应的 `/v1/models` 模型发现接口。
+- **多协议兼容**：`POST /v1/responses`、`POST /v1/chat/completions`、`POST /v1/messages`、`POST /v1/audio/transcriptions`（语音转写），以及对应的 `/v1/models` 模型发现接口。
 - **流式与一次性响应**：均支持 JSON 和 SSE 流式输出。
 - **OpenAI Responses WebSocket**：支持 `GET /v1/responses` 升级为 WebSocket，供 Codex 等客户端使用。
 - **工具调用（function calling）**：Responses / Chat / Anthropic 均支持函数工具。
 - **推理/thinking 内容**：自动把上游思考过程映射到各协议对应字段。
 - **图片输入**：支持 base64 data URL 形式的图片；Responses 兼容 `input_image` 字符串与 `image_url` 对象、`image_url` part 等写法。
-- **管理面板**：访问 `/panel` 查看模型列表、渠道/供应商、账户用量与价格筛选。
+- **管理面板**：`/panel`（默认关闭，`dashboard.enabled` 开启）查看模型分类、渠道/供应商、账户用量、促销倒计时与价格筛选；密码支持随机/固定/免密三种模式。
 - **流控与连接模型**：`server.max_concurrency` 限制并发；`devin.force_http1` 默认强制 HTTP/1.1，避免 HTTP/2 单连接多 stream 被上游串行处理。
-- **代理**：支持 `http://`、`https://`、`socks5://`、`socks5h://` 代理，或留空走系统 `HTTP_PROXY` / `HTTPS_PROXY`。
+- **代理与分流**：默认直连；`devin.proxy` 作为兜底出口；`devin.proxy_pools` 支持任意命名的代理池（池内多地址轮询分摊并发）；`devin.routes` 按模型 uid/标签/系列/分组通配符把不同模型分流到不同池；支持 `http://`、`https://`、`socks5://`、`socks5h://`，可带认证；全部修改后重启生效。
 - **请求级调试日志**：开启 `debug.enabled` 后在 `logs/` 目录下输出每请求的完整链路。
 
 ## 快速开始
@@ -23,13 +23,21 @@
 
 `devin-2api` 需要 Devin / Windsurf 的 session token，格式为 `devin-session-token$...`。
 
-macOS 示例：
+Windows（PowerShell 一键提取，无需安装 sqlite3，兼容 user/system 安装）：
 
-```bash
-sqlite3 ~/Library/"Application Support"/Devin/User/globalStorage/state.vscdb \
-  "SELECT json_extract(value, '$.apiKey') FROM ItemTable WHERE key='windsurfAuthStatus';"
+```powershell
+Get-ChildItem "$env:APPDATA","$env:LOCALAPPDATA" -Recurse -Filter state.vscdb -ErrorAction SilentlyContinue | ForEach-Object {
+  try {
+    $fs = [System.IO.File]::Open($_.FullName, 'Open', 'Read', 'ReadWrite')
+    $text = (New-Object System.IO.StreamReader($fs)).ReadToEnd(); $fs.Close()
+    if ($text -match 'devin-session-token\$[^\s"''\\,;(){}\[\]]+') { "{0}`t{1}" -f $Matches[0], $_.FullName }
+  } catch {}
+}
 ```
-Windows 示例（PowerShell）：
+
+该命令递归扫描 `%APPDATA%` / `%LOCALAPPDATA%` 下所有 `state.vscdb`（Devin / Devin - Next / Windsurf / VS Code 等客户端的本地状态库，user 与 system 安装都会写这里），直接从库文件字节中正则提取 token 并打印来源路径，复制即用，无任何外部依赖。
+
+若已安装 sqlite3，也可以精确查询：
 
 ```powershell
 $state = "$env:APPDATA\devin\User\globalStorage\state.vscdb"
@@ -38,14 +46,14 @@ $state = "$env:APPDATA\devin\User\globalStorage\state.vscdb"
 sqlite3 $state "SELECT json_extract(value, '\$.apiKey') FROM ItemTable WHERE key='windsurfAuthStatus';"
 ```
 
-Token 保存在 Devin / Devin - Next 客户端本地状态 `%APPDATA%` 下。如果上述路径不存在，可在 `%APPDATA%` 下搜索所有 `state.vscdb`：
+macOS 示例：
 
-```powershell
-Get-ChildItem -Path $env:APPDATA -Recurse -Filter state.vscdb -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+```bash
+sqlite3 ~/Library/"Application Support"/Devin/User/globalStorage/state.vscdb \
+  "SELECT json_extract(value, '$.apiKey') FROM ItemTable WHERE key='windsurfAuthStatus';"
 ```
-Windsurf / Devin 扩展同样把 token 存在 `%APPDATA%\Code\User\globalStorage\state.vscdb`。如果该路径不存在，可在 `%APPDATA%` 或 Windsurf 安装目录下搜索 `state.vscdb`。
 
-Linux 用户可以在对应应用目录的 `state.vscdb` 中查找同样的键，或直接从 Devin / Windsurf 客户端的本地存储中提取。
+Linux 用户可以在对应应用目录的 `state.vscdb` 中查找同样的键，或用同样的字符串匹配思路提取。
 
 ### 2. 配置
 
@@ -64,11 +72,12 @@ devin:
   base_url: "https://server.codeium.com"
   token: "devin-session-token$..."   # 必填
   model: "glm-5-2"                   # 默认模型 UID，可按需修改
-  # proxy: "socks5://127.0.0.1:1080" # 可选代理
+  # proxy: "socks5://127.0.0.1:1080" # 可选代理，重启生效
   force_http1: true                  # 默认强制 HTTP/1.1
 
 dashboard:
-  password: ""              # 管理面板密码；留空直接访问 /panel
+  enabled: true             # 默认关闭；true 启用 /panel
+  password: ""              # 留空 = 随机密码（见启动日志）；"none" = 免密
 
 auth:
   api_key: ""               # /v1/* 访问密钥；留空不校验
@@ -108,9 +117,10 @@ curl http://localhost:8080/healthz
 | `/v1/responses` | GET | 升级 WebSocket（子协议 `responses_websockets=2026-02-06`） |
 | `/v1/chat/completions` | POST | OpenAI Chat Completions API（JSON / SSE） |
 | `/v1/messages` | POST | Anthropic Messages API（JSON / SSE） |
-| `/panel` | GET | 管理面板 |
-| `/panel/login` | POST | 面板登录 |
-| `/panel/api/*` | GET | 面板数据 API |
+| `/v1/audio/transcriptions` | POST | OpenAI 兼容语音转写：multipart `file` 字段（wav/mp3/m4a，≤25MiB）→ `{"text": ...}` |
+| `/panel` | GET | 管理面板（需 `dashboard.enabled: true`） |
+| `/panel/login` | POST | 面板登录（需 `dashboard.enabled: true`） |
+| `/panel/api/*` | GET | 面板数据 API（需 `dashboard.enabled: true`） |
 
 `/v1/*` 端点默认无需鉴权。设置 `auth.api_key` 后，客户端需通过 `Authorization: Bearer <key>` 或 `X-Api-Key: <key>` 传递。
 
@@ -231,10 +241,13 @@ curl http://localhost:8080/v1/models
 | `devin.base_url` | Devin Connect 上游地址 | 配置了 `devin.token` 后必填 |
 | `devin.token` | Devin session token（`devin-session-token$...`） | 否；未设置时 `/v1/*` 返回 503 |
 | `devin.model` | 默认 chat model UID（如 `glm-5-2`） | 配置了 `devin.token` 后必填 |
-| `devin.proxy` | 代理地址；支持 `http/https/socks5/socks5h` | 否 |
+| `devin.proxy` | 上游代理地址；支持 `http/https/socks5/socks5h`，可带认证；对话流量兜底出口 + 面板数据出口；留空直连或走系统 `HTTP_PROXY`/`HTTPS_PROXY`；修改后重启生效 | 否 |
+| `devin.proxy_pools` | 任意命名的代理池集合：`名字: [代理地址...]`；池内多地址按请求轮询分摊并发；保留名 `direct`/`default` | 否 |
+| `devin.routes` | 分流规则列表：`- models: [通配符...] pool: 池名`；自上而下首个命中的规则生效，按模型 uid/标签/系列/分组匹配（`*`/`?`，忽略大小写）；未命中走 `devin.proxy` | 否 |
 | `devin.force_http1` | 强制 HTTP/1.1，避免 HTTP/2 单连接多 stream 并发瓶颈 | 否；默认 `true` |
 | `debug.enabled` | 在配置文件同目录 `logs/` 下写请求级调试日志 | 否 |
-| `dashboard.password` | 管理面板密码；留空无需登录 | 否 |
+| `dashboard.enabled` | 是否启用 `/panel` 管理面板 | 否；默认 `false`（关闭） |
+| `dashboard.password` | 面板密码：留空=随机密码（打印启动日志）、`none`=免密、其他=固定密码 | 否 |
 | `auth.api_key` | `/v1/*` 接口访问密钥；留空不鉴权 | 否 |
 
 完整示例：
@@ -254,6 +267,7 @@ debug:
   enabled: false
 
 dashboard:
+  enabled: true
   password: ""
 
 auth:
@@ -262,12 +276,48 @@ auth:
 
 ## 管理面板
 
-启动后访问 `http://localhost:8080/panel`：
+面板默认关闭（`dashboard.enabled` 未设置或 `false` 时 `/panel` 返回 404）。开启后访问 `http://localhost:8080/panel`：
 
-- `dashboard.password` 为空时直接进入；
-- 设置密码后，首次访问需登录，会话 cookie 24 小时有效；
-- 展示当前可用模型、所属渠道/供应商、图片能力；
-- 展示账户用量、价格区间与筛选。
+- `dashboard.enabled: true` 启用面板；需 `devin.token` 已配置，否则面板不启用（启动日志有提示）；
+- `dashboard.password` 三种模式：
+  - **留空（默认）**：每次启动生成随机密码并打印到启动日志，重启后变化；
+  - **`"none"`**：免密开放，仅限可信本机/内网环境；
+  - **其他字符串**：固定密码；
+- 登录会话 cookie 24 小时有效；
+- 面板分两个页签：**统计**（请求数/成功率/耗时/token 进出缓存用量、24h 柱状+折线图、最近 20 条请求含客户端 IP 与可展开详情、在线时长、模型 TOP）与**模型**（分类/渠道/促销图标悬浮详情/价格筛选与同系列合并）；促销模型名称旁的 🎁 图标悬浮显示起止、剩余与原价/现价；
+- 最近请求点击行可展开 请求头（Authorization/X-Api-Key 等敏感头不记录）/请求体/响应，详情只存内存不落盘（≤48KB 截断）；
+- 统计为进程内存聚合，每 5 分钟落盘到配置文件同目录 `stats.json`（存在即合并续计），退出时再保存一次；面板页每 15 秒自动刷新统计。
+
+## 代理池与模型分流
+
+上游按出口地区下发不同的模型目录：直连（国内）约 50 个模型；走美区代理则下发全量约 300 个（`claude-*`、`gpt-*`、`gemini-*`、`grok-*`、`muse-*` 等）。因此 `devin.proxy` 同时也是**目录出口**——想看到全量模型就把它设为美区代理，再用 `routes` 把低延迟需求的模型拉回直连：
+
+```yaml
+devin:
+  proxy: "socks5://user:pass@us1.example.com:1080"  # 美区出口：全量目录 + 面板 + 未分流模型
+  proxy_pools:                    # 动态命名，池内多地址按请求轮询（可选）
+    us:
+      - "socks5://user:pass@us1.example.com:1080"
+      - "socks5://user:pass@us2.example.com:1080"
+  routes:                         # 自上而下，首个命中生效
+    - models: ["swe-*", "glm-*", "kimi-*", "deepseek-*", "nemotron-*", "qwen-*", "minimax-*"]
+      pool: direct                # 国内可用模型 → 直连低延迟
+      # 未命中的 claude-*/gpt-*/gemini-* 等 → 走 devin.proxy 美区兜底
+```
+
+反过来也行：`proxy` 留空（目录只显示国内可见模型），显式把美区模型路由到池中：
+
+```yaml
+  routes:
+    - models: ["claude-*", "gpt-*", "gemini-*", "grok-*", "muse-*"]
+      pool: us
+```
+
+- `models` 每条模式按模型 **uid / 显示名 / 系列(family) / 上游分组名** 匹配；支持 `*`（任意串）、`?`（单字符），忽略大小写；分组匹配需要目录已加载（首个请求自动拉取，失败时退化为 uid/标签/系列匹配）。
+- `pool` 填 `proxy_pools` 中的名字；内置保留名：`direct`（直连）、`default`（= `devin.proxy`）。
+- 规则仅作用于对话流量（`/v1/*`）；面板数据与模型目录始终走 `devin.proxy`。
+- 池内多地址轮询分摊并发，适合"同一个出口多个入口"的场景；高延迟代理建议只承担少量模型。
+- 修改后重启生效；代理 URL 可内嵌 `user:pass` 认证，注意 `config.yaml` 权限、勿提交凭据。
 
 ## 注意事项
 

@@ -102,6 +102,19 @@ go run ./cmd/devin-2api -config config.yaml
 - generation options: `instructions`, `tools` (function type with JSON Schema `parameters`), `stream`;
 - `stream: false` returns a full JSON Response; `stream: true` returns typed SSE (`response.created`, `response.output_item.added`, `response.output_text.delta`, `response.completed`, …).
 
+`/v1/audio/transcriptions` accepts `multipart/form-data` with a `file` field (any audio bytes, ≤25MiB) and returns `{"text": ...}` via upstream `ApiServerService.GetTranscription`.
+
+### Upstream RPCs not yet wired
+
+`ApiServerService` exposes more RPCs that are reachable but need the exact Windsurf client payload before they can be mapped cleanly:
+
+- `GetCompletions` / `GetStreamingCompletions` — tab autocomplete (FIM). The `CompletionsRequest.prompt` pipeline depends on prompt-element ranges/kind info built by the real client; a bare `{prompt, language}` probe returns `invalid_argument`.
+- `GetEmbeddings` — `{prompts[], model: MODEL_EMBED_6591}` probe returns `failed_precondition`; likely requires a specific priority/prefix/experiment flag.
+- `GetStreamingModelAPITextCompletion` — takes `chat_message_prompts` + numeric `ExaCodeiumCommonPb_Model` enum; catalog uids are strings without a published uid→enum mapping.
+- `GetCommandModelConfigs` — returns the "command" models used for commit-message generation etc. (`swe-2-flash-medium` + `MODEL_PRIVATE_2` "Claude 4.5 Sonnet"). **Merged**: appended to `/v1/models` and the panel catalog with `is_command: true` (dedup by uid, best-effort on upstream error) — they're callable via GetChatMessage even though they're absent from the picker.
+
+Probe tool: `DEVIN_TOKEN=... [HTTPS_PROXY=...] go run ./cmd/probe-api`.
+
 ### Tool description passing
 
 Intermediate tools are converted into Devin native function tools (name and JSON Schema constraints preserved, while natural-language annotations such as `description`/`title` — which upstream may misinterpret as classification hints — are stripped); non-empty tool descriptions are additionally injected into the system prompt as `<tool name="...">` blocks so the model understands their purpose. See `internal/adapter/devin/tool_definition.go`.

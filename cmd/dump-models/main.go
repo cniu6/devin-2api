@@ -147,11 +147,28 @@ func main() {
 		rows = append(rows, r)
 	}
 
+	var sorts []map[string]any
+	for _, s := range resp.Msg.GetClientModelSorts() {
+		var groups []map[string]any
+		for _, g := range s.GetGroups() {
+			groups = append(groups, map[string]any{
+				"name":         g.GetGroupName(),
+				"model_labels": g.GetModelLabels(),
+			})
+		}
+		sorts = append(sorts, map[string]any{
+			"name":           s.GetName(),
+			"display_metric": s.GetDisplayMetric(),
+			"groups":         groups,
+		})
+	}
+
 	out := map[string]any{
 		"total":            len(rows),
 		"empty_multiplier": emptyMult,
 		"with_dimensions":  withDims,
 		"with_promo":       withPromo,
+		"model_sorts":      sorts,
 		"rows":             rows,
 	}
 	f, _ := os.Create("outputs/model-dump.json")

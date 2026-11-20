@@ -3,15 +3,19 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -21,6 +25,8 @@ import (
 	"github.com/leookun/devin-2api/internal/config"
 	"github.com/leookun/devin-2api/internal/dashboard"
 	"github.com/leookun/devin-2api/internal/debuglog"
+	"github.com/leookun/devin-2api/internal/httpproxy"
+	"github.com/leookun/devin-2api/internal/stats"
 )
 
 func main() {
@@ -43,6 +49,8 @@ func main() {
 			Token:      serviceConfig.Devin.Token,
 			Model:      serviceConfig.Devin.Model,
 			Proxy:      serviceConfig.Devin.Proxy,
+			ProxyPools: proxyPoolsMap(serviceConfig.Devin.ProxyPools),
+			Routes:     proxyRoutes(serviceConfig.Devin.Routes),
 			ForceHTTP1: serviceConfig.Devin.ForceHTTP1 != nil && *serviceConfig.Devin.ForceHTTP1,
 		})
 		if createErr != nil {
@@ -54,10 +62,37 @@ func main() {
 	if serviceConfig.Debug.Enabled {
 		debugManager = debuglog.NewManager(filepath.Join(filepath.Dir(absoluteConfigPath), "logs"))
 	}
+	// 请求统计：内存聚合，每 5 分钟增量落盘到配置文件同目录 stats.json，退出时再保存一次。
+	statsCollector := stats.New(filepath.Join(filepath.Dir(absoluteConfigPath), "stats.json"))
+	defer statsCollector.Close()
 	application := app.New(providerAdapter, serviceConfig.Server, debugManager)
 	application.SetAPIKey(serviceConfig.Auth.APIKey)
-	if serviceConfig.Devin.Token != "" {
-		application.SetDashboard(dashboard.New(serviceConfig.Dashboard.Password, serviceConfig.Devin.BaseURL, serviceConfig.Devin.Token, serviceConfig.Devin.Proxy, serviceConfig.Devin.ForceHTTP1 != nil && *serviceConfig.Devin.ForceHTTP1))
+	application.SetStats(statsCollector)
+
+	if proxy := strings.TrimSpace(serviceConfig.Devin.Proxy); proxy != "" {
+		// 代理在启动时应用到全部上游请求（对话 + 面板数据），修改 config 后需重启生效。
+		log.Printf("devin upstream proxy: %s", maskProxyUserinfo(proxy))
+	}
+	switch {
+	case !serviceConfig.Dashboard.Enabled:
+		if serviceConfig.Dashboard.Password != "" {
+			log.Printf("dashboard.password is set but dashboard.enabled is off; /panel disabled")
+		}
+	case serviceConfig.Devin.Token == "":
+		log.Printf("dashboard.enabled=true but devin.token is empty; /panel disabled")
+	default:
+		password, generated := resolveDashboardPassword(serviceConfig.Dashboard.Password)
+		dashboardHandler := dashboard.New(password, serviceConfig.Devin.BaseURL, serviceConfig.Devin.Token, serviceConfig.Devin.Proxy, serviceConfig.Devin.ForceHTTP1 != nil && *serviceConfig.Devin.ForceHTTP1)
+		dashboardHandler.SetStats(statsCollector)
+		application.SetDashboard(dashboardHandler)
+		switch {
+		case generated:
+			log.Printf("dashboard enabled at /panel, random password: %s (set dashboard.password to fix it, \"none\" for open access)", password)
+		case password == "":
+			log.Printf("dashboard enabled at /panel without password (dashboard.password=none)")
+		default:
+			log.Printf("dashboard enabled at /panel (password from config)")
+		}
 	}
 	server := application.HTTPServer()
 	log.Printf("HTTP server listening on %s", listenURL(server.Addr))
@@ -67,6 +102,62 @@ func main() {
 	if err := run(ctx, server); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// proxyPoolsMap 把 config 的 StringList 池映射为 httpproxy 需要的 []string。
+func proxyPoolsMap(pools map[string]config.StringList) map[string][]string {
+	if len(pools) == 0 {
+		return nil
+	}
+	result := make(map[string][]string, len(pools))
+	for name, urls := range pools {
+		result[name] = []string(urls)
+	}
+	return result
+}
+
+// proxyRoutes 把 config 的 RouteRule 转换为 httpproxy.Route。
+func proxyRoutes(rules []config.RouteRule) []httpproxy.Route {
+	if len(rules) == 0 {
+		return nil
+	}
+	routes := make([]httpproxy.Route, 0, len(rules))
+	for _, rule := range rules {
+		routes = append(routes, httpproxy.Route{Patterns: []string(rule.Models), Pool: rule.Pool})
+	}
+	return routes
+}
+
+// resolveDashboardPassword 解析面板密码配置：
+// 留空 → 生成随机密码（generated=true，由调用方打印日志）；
+// "none" → 返回空字符串，面板免密开放；
+// 其他 → 固定密码原样返回。
+func resolveDashboardPassword(password string) (resolved string, generated bool) {
+	trimmed := strings.TrimSpace(password)
+	if strings.EqualFold(trimmed, "none") {
+		return "", false
+	}
+	if trimmed != "" {
+		return trimmed, false
+	}
+	buf := make([]byte, 9)
+	if _, err := rand.Read(buf); err != nil {
+		// crypto/rand 不可用时退回固定默认密码，保证面板不至于完全无法访问。
+		return "devin-panel", false
+	}
+	return hex.EncodeToString(buf), true
+}
+
+// maskProxyUserinfo 脱敏代理 URL 中的口令部分，避免把代理密码写入启动日志。
+func maskProxyUserinfo(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.User == nil {
+		return raw
+	}
+	if _, hasPassword := parsed.User.Password(); hasPassword {
+		parsed.User = url.UserPassword(parsed.User.Username(), "hidden")
+	}
+	return parsed.String()
 }
 
 // listenURL 生成启动日志中的监听描述：配置为通配地址时同时给出 localhost 可访问地址。

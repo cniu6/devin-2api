@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/leookun/devin-2api/internal/config"
 	"github.com/leookun/devin-2api/internal/debuglog"
 	"github.com/leookun/devin-2api/internal/llm"
+	"github.com/leookun/devin-2api/internal/stats"
 )
 
 // DashboardRegistrar 描述面板路由注册所需的最小能力。
@@ -58,6 +60,8 @@ type App struct {
 	apiKey string
 	// concurrency 限制同时处理的 /v1/* 请求数。
 	concurrency chan struct{}
+	// stats 收集请求级 token/耗时统计，供 /panel/api/stats 展示。
+	stats *stats.Collector
 }
 
 // New 创建一个使用指定供应商适配器的 HTTP 应用。
@@ -84,6 +88,11 @@ func (application *App) SetDashboard(d DashboardRegistrar) {
 	application.dashboard = d
 }
 
+// SetStats 注入请求统计采集器；nil 表示关闭统计。
+func (application *App) SetStats(collector *stats.Collector) {
+	application.stats = collector
+}
+
 // Router 返回应用的 chi HTTP 路由。
 func (application *App) Router() http.Handler {
 	router := chi.NewRouter()
@@ -97,6 +106,7 @@ func (application *App) Router() http.Handler {
 		protected.Post("/v1/responses", application.createResponses)
 		protected.Post("/v1/chat/completions", application.createChatCompletions)
 		protected.Post("/v1/messages", application.createMessages)
+		protected.Post("/v1/audio/transcriptions", application.createTranscription)
 	})
 	if application.dashboard != nil {
 		application.dashboard.Register(router)
@@ -268,6 +278,67 @@ func (application *App) createMessages(writer http.ResponseWriter, request *http
 	application.createCompletion(writer, request, decodeAnthropicRequest, anthropicProtocol{})
 }
 
+// createTranscription 处理 OpenAI 兼容的 POST /v1/audio/transcriptions：
+// multipart/form-data 中的 file 字段为音频（wav/mp3/m4a 等，上限 25MiB），
+// 上游 GetTranscription 转写后以 {"text": ...} 返回；model 等附加字段透传忽略。
+func (application *App) createTranscription(writer http.ResponseWriter, request *http.Request) {
+	startedAt := time.Now()
+	result := "failed"
+	var respData []byte
+	defer func() {
+		if application.stats == nil {
+			return
+		}
+		entry := stats.Entry{Path: request.URL.Path, IP: clientIP(request), Model: "transcription", Result: result, DurationMS: time.Since(startedAt).Milliseconds()}
+		if len(request.Header) > 0 {
+			entry.ReqHeaders = make(map[string]string, len(request.Header))
+			for name, values := range request.Header {
+				if sensitiveHeaders[http.CanonicalHeaderKey(name)] {
+					continue
+				}
+				entry.ReqHeaders[name] = strings.Join(values, ", ")
+			}
+		}
+		entry.RespBody = stats.TruncateBody(respData)
+		application.stats.Record(entry)
+	}()
+	if application.adapter == nil {
+		writeJSONError(writer, http.StatusServiceUnavailable, "provider adapter is not configured")
+		return
+	}
+	transcriber, ok := application.adapter.(adapter.AudioTranscriber)
+	if !ok {
+		writeJSONError(writer, http.StatusServiceUnavailable, "audio transcription is not supported by the configured provider")
+		return
+	}
+	// 与 OpenAI 25MB 上限对齐；multipart 解析只留 file 字段。
+	request.Body = http.MaxBytesReader(writer, request.Body, 25<<20)
+	if err := request.ParseMultipartForm(4 << 20); err != nil {
+		writeJSONError(writer, http.StatusBadRequest, "expected multipart/form-data with a file field")
+		return
+	}
+	file, _, err := request.FormFile("file")
+	if err != nil {
+		writeJSONError(writer, http.StatusBadRequest, "multipart field \"file\" is required")
+		return
+	}
+	defer file.Close()
+	audio, err := io.ReadAll(file)
+	if err != nil || len(audio) == 0 {
+		writeJSONError(writer, http.StatusBadRequest, "failed to read audio file")
+		return
+	}
+	text, err := transcriber.TranscribeAudio(request.Context(), audio)
+	if err != nil {
+		writeJSONError(writer, mapProviderErrorStatus(err), err.Error())
+		return
+	}
+	writer.Header().Set("Content-Type", "application/json")
+	respData, _ = json.Marshal(map[string]any{"text": text})
+	_, _ = writer.Write(respData)
+	result = "completed"
+}
+
 func (application *App) createCompletion(
 	writer http.ResponseWriter,
 	request *http.Request,
@@ -276,7 +347,13 @@ func (application *App) createCompletion(
 ) {
 	recorder := application.debugManager.Start(debuglog.RequestMeta{Method: request.Method, Path: request.URL.Path})
 	completion := debuglog.Completion{StatusCode: http.StatusInternalServerError, Result: "failed"}
-	defer func() { recorder.Complete(completion) }()
+	startedAt := time.Now()
+	var finalMessage *llm.AssistantMessage
+	var reqBodyCopy, respBody []byte
+	defer func() {
+		recorder.Complete(completion)
+		application.recordStats(request, reqBodyCopy, respBody, completion, finalMessage, startedAt)
+	}()
 
 	if application.adapter == nil {
 		completion.StatusCode = http.StatusServiceUnavailable
@@ -290,6 +367,7 @@ func (application *App) createCompletion(
 		writeLoggedError(writer, recorder, "http_read", completion.StatusCode, fmt.Errorf("read request: %w", err))
 		return
 	}
+	reqBodyCopy = body
 	recorder.WriteJSON("01-http-request.json", httpRequestProjection(request, body))
 	messages, options, err := decoder(body)
 	if err != nil {
@@ -325,6 +403,7 @@ func (application *App) createCompletion(
 		completion.StatusCode = http.StatusOK
 		message, streamErr := writeProtocolStream(ctx, writer, stream, recorder, protocol, messages.Model, options, firstEvent, err)
 		updateCompletionIdentity(&completion, message)
+		finalMessage = message
 		if streamErr != nil {
 			if errors.Is(streamErr, context.Canceled) || errors.Is(streamErr, context.DeadlineExceeded) {
 				completion.Result = "disconnected"
@@ -344,12 +423,14 @@ func (application *App) createCompletion(
 		return
 	}
 	updateCompletionIdentity(&completion, message)
+	finalMessage = message
 	body, err = protocol.EncodeFinal(message)
 	if err != nil {
 		completion.StatusCode = http.StatusInternalServerError
 		writeLoggedError(writer, recorder, "http_encode", completion.StatusCode, err)
 		return
 	}
+	respBody = body
 	writer.Header().Set("Content-Type", "application/json")
 	if _, err := writer.Write(body); err != nil {
 		completion.Result = "disconnected"
@@ -359,6 +440,76 @@ func (application *App) createCompletion(
 	recorder.AppendJSONL("06-http-response.jsonl", "response", json.RawMessage(body))
 	completion.StatusCode = http.StatusOK
 	completion.Result = "completed"
+}
+
+// sensitiveHeaders 不计入「最近请求」详情的请求头（含密钥）。
+var sensitiveHeaders = map[string]bool{
+	"Authorization":       true,
+	"X-Api-Key":           true,
+	"Cookie":              true,
+	"Proxy-Authorization": true,
+}
+
+// clientIP 取请求方 IP：优先 X-Forwarded-For 首个 hop，否则 RemoteAddr 主机部分。
+func clientIP(request *http.Request) string {
+	if xff := request.Header.Get("X-Forwarded-For"); xff != "" {
+		if idx := strings.Index(xff, ","); idx >= 0 {
+			return strings.TrimSpace(xff[:idx])
+		}
+		return strings.TrimSpace(xff)
+	}
+	host, _, err := net.SplitHostPort(request.RemoteAddr)
+	if err != nil {
+		return request.RemoteAddr
+	}
+	return host
+}
+
+// recordStats 在请求收口处写入统计；finalMessage 为 nil 时（失败/断开）仅计请求与耗时。
+// reqBody/respBody 为面板「最近请求」详情，仅内存保留、截断到上限。
+func (application *App) recordStats(request *http.Request, reqBody, respBody []byte, completion debuglog.Completion, message *llm.AssistantMessage, startedAt time.Time) {
+	if application.stats == nil {
+		return
+	}
+	entry := stats.Entry{
+		Path:       request.URL.Path,
+		IP:         clientIP(request),
+		Model:      completion.Model,
+		Result:     completion.Result,
+		Status:     completion.StatusCode,
+		DurationMS: time.Since(startedAt).Milliseconds(),
+		ReqBody:    stats.TruncateBody(reqBody),
+	}
+	if len(request.Header) > 0 {
+		entry.ReqHeaders = make(map[string]string, len(request.Header))
+		for name, values := range request.Header {
+			if sensitiveHeaders[http.CanonicalHeaderKey(name)] {
+				continue
+			}
+			entry.ReqHeaders[name] = strings.Join(values, ", ")
+		}
+	}
+	if len(respBody) > 0 {
+		entry.RespBody = stats.TruncateBody(respBody)
+	} else if message != nil {
+		// 流式路径没有整包响应字节，序列化最终消息（含用量/停止原因）作为详情。
+		if data, err := json.Marshal(message); err == nil {
+			entry.RespBody = stats.TruncateBody(data)
+		}
+	}
+	if message != nil {
+		usage := message.Usage
+		entry.Input = usage.Input
+		entry.Output = usage.Output
+		entry.CacheRead = usage.CacheRead
+		entry.CacheWrite = usage.CacheWrite
+		if usage.TotalTokens > 0 {
+			entry.Total = usage.TotalTokens
+		} else {
+			entry.Total = usage.Input + usage.Output
+		}
+	}
+	application.stats.Record(entry)
 }
 
 func writeProtocolStream(

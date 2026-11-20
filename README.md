@@ -6,15 +6,15 @@
 
 ## Features
 
-- **Multi-protocol support**: `POST /v1/responses`, `POST /v1/chat/completions`, `POST /v1/messages`, plus `/v1/models` model discovery.
+- **Multi-protocol support**: `POST /v1/responses`, `POST /v1/chat/completions`, `POST /v1/messages`, `POST /v1/audio/transcriptions` (speech-to-text), plus `/v1/models` model discovery.
 - **Streaming and non-streaming** responses in JSON and SSE.
 - **OpenAI Responses WebSocket**: `GET /v1/responses` upgrades to WebSocket for clients such as Codex.
 - **Function calling**: supported across Responses, Chat, and Anthropic protocols.
 - **Reasoning / thinking content**: upstream thinking is mapped to the corresponding fields of each protocol.
 - **Image input**: supports base64 data URL images; Responses also accepts `input_image` as a string or `image_url` object, as well as `image_url` parts.
-- **Dashboard**: visit `/panel` for model list, providers, account usage, and price filters.
+- **Dashboard**: `/panel` (off by default, enable via `dashboard.enabled`) shows model categories, providers, account usage, promo countdowns, and price filters; password supports random / fixed / open modes.
 - **Concurrency and connection model**: `server.max_concurrency` limits concurrent `/v1/*` requests; `devin.force_http1` defaults to `true` to avoid HTTP/2 multi-stream serialization by the upstream.
-- **Proxy support**: `http://`, `https://`, `socks5://`, `socks5h://` proxy, or leave empty to use system `HTTP_PROXY` / `HTTPS_PROXY`.
+- **Proxy & routing**: direct by default; `devin.proxy` is the fallback egress; `devin.proxy_pools` defines arbitrarily named pools (multiple addresses per pool, per-request round-robin to spread concurrency); `devin.routes` maps models to pools via uid/label/family/group wildcards; `http://`, `https://`, `socks5://`, `socks5h://` with optional auth; all changes take effect on restart.
 - **Request-level debug logs**: enable with `debug.enabled`; logs each request lifecycle under `logs/`.
 
 ## Quick start
@@ -23,14 +23,21 @@
 
 `devin-2api` needs a Devin / Windsurf session token in the `devin-session-token$...` format.
 
-On macOS:
+On Windows (one-shot PowerShell, no sqlite3 required, works for user/system installs):
 
-```bash
-sqlite3 ~/Library/"Application Support"/Devin/User/globalStorage/state.vscdb \
-  "SELECT json_extract(value, '$.apiKey') FROM ItemTable WHERE key='windsurfAuthStatus';"
+```powershell
+Get-ChildItem "$env:APPDATA","$env:LOCALAPPDATA" -Recurse -Filter state.vscdb -ErrorAction SilentlyContinue | ForEach-Object {
+  try {
+    $fs = [System.IO.File]::Open($_.FullName, 'Open', 'Read', 'ReadWrite')
+    $text = (New-Object System.IO.StreamReader($fs)).ReadToEnd(); $fs.Close()
+    if ($text -match 'devin-session-token\$[^\s"''\\,;(){}\[\]]+') { "{0}`t{1}" -f $Matches[0], $_.FullName }
+  } catch {}
+}
 ```
 
-On Windows (PowerShell):
+This recursively scans every `state.vscdb` under `%APPDATA%` / `%LOCALAPPDATA%` (the local state DB used by Devin / Devin - Next / Windsurf / VS Code clients — both user and system installs write there), regex-extracts the token straight from the file bytes, and prints it together with the source path. Copy-paste and go, zero dependencies.
+
+If you do have sqlite3 installed, a precise query works too:
 
 ```powershell
 $state = "$env:APPDATA\devin\User\globalStorage\state.vscdb"
@@ -39,13 +46,14 @@ $state = "$env:APPDATA\devin\User\globalStorage\state.vscdb"
 sqlite3 $state "SELECT json_extract(value, '\$.apiKey') FROM ItemTable WHERE key='windsurfAuthStatus';"
 ```
 
-The token is stored in the Devin / Devin - Next client local state under `%APPDATA%`. If the path above does not exist, search for `state.vscdb` under `%APPDATA%`:
+On macOS:
 
-```powershell
-Get-ChildItem -Path $env:APPDATA -Recurse -Filter state.vscdb -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+```bash
+sqlite3 ~/Library/"Application Support"/Devin/User/globalStorage/state.vscdb \
+  "SELECT json_extract(value, '$.apiKey') FROM ItemTable WHERE key='windsurfAuthStatus';"
 ```
 
-Linux users can look for the same key in the equivalent `state.vscdb` path, or extract the token from the Devin / Windsurf client local storage.
+Linux users can look for the same key in the equivalent `state.vscdb` path, or extract the token with the same string-matching approach.
 
 ### 2. Configure
 
@@ -64,11 +72,12 @@ devin:
   base_url: "https://server.codeium.com"
   token: "devin-session-token$..."  # required
   model: "glm-5-2"                  # default model UID
-  # proxy: "socks5://127.0.0.1:1080" # optional proxy
+  # proxy: "socks5://127.0.0.1:1080" # optional proxy, effective on restart
   force_http1: true                 # force HTTP/1.1 by default
 
 dashboard:
-  password: ""             # dashboard password; empty = open /panel
+  enabled: true            # off by default; true enables /panel
+  password: ""             # empty = random password (see startup log); "none" = open
 
 auth:
   api_key: ""              # /v1/* API key; empty = no auth
@@ -108,9 +117,10 @@ curl http://localhost:8080/healthz
 | `/v1/responses` | GET | WebSocket upgrade (subprotocol `responses_websockets=2026-02-06`) |
 | `/v1/chat/completions` | POST | OpenAI Chat Completions API (JSON / SSE) |
 | `/v1/messages` | POST | Anthropic Messages API (JSON / SSE) |
-| `/panel` | GET | Dashboard |
-| `/panel/login` | POST | Dashboard login |
-| `/panel/api/*` | GET | Dashboard data APIs |
+| `/v1/audio/transcriptions` | POST | OpenAI-compatible speech-to-text: multipart `file` field (wav/mp3/m4a, ≤25MiB) → `{"text": ...}` |
+| `/panel` | GET | Dashboard (requires `dashboard.enabled: true`) |
+| `/panel/login` | POST | Dashboard login (requires `dashboard.enabled: true`) |
+| `/panel/api/*` | GET | Dashboard data APIs (requires `dashboard.enabled: true`) |
 
 `/v1/*` endpoints are open by default. Set `auth.api_key` and send it via `Authorization: Bearer <key>` or `X-Api-Key: <key>`.
 
@@ -231,10 +241,13 @@ All settings live in `config.yaml`, loaded once at startup; unknown fields are r
 | `devin.base_url` | Devin Connect upstream URL | Required once `devin.token` is set |
 | `devin.token` | Devin session token (`devin-session-token$...`) | No; `/v1/*` returns 503 if unset |
 | `devin.model` | Default chat model UID (e.g. `glm-5-2`) | Required once `devin.token` is set |
-| `devin.proxy` | Proxy URL; supports `http/https/socks5/socks5h` | No |
+| `devin.proxy` | Upstream proxy URL; `http/https/socks5/socks5h` with optional auth; fallback egress for chat traffic + panel data egress; empty = direct or system `HTTP_PROXY`/`HTTPS_PROXY`; effective on restart | No |
+| `devin.proxy_pools` | Arbitrarily named proxy pools: `name: [urls...]`; addresses inside a pool rotate per request to spread concurrency; reserved names: `direct`/`default` | No |
+| `devin.routes` | Routing rules: `- models: [patterns...] pool: name`; first match wins; matched against model uid/label/family/upstream group (`*`/`?`, case-insensitive); unmatched models use `devin.proxy` | No |
 | `devin.force_http1` | Force HTTP/1.1 to avoid HTTP/2 multi-stream serialization | No; defaults to `true` |
 | `debug.enabled` | Write per-request debug logs under `logs/` | No |
-| `dashboard.password` | Dashboard password; empty = no login | No |
+| `dashboard.enabled` | Enable the `/panel` dashboard | No; defaults to `false` (off) |
+| `dashboard.password` | Panel password: empty = random (printed in startup log), `none` = open access, other = fixed | No |
 | `auth.api_key` | API key for `/v1/*`; empty disables auth | No |
 
 Full example:
@@ -254,6 +267,7 @@ debug:
   enabled: false
 
 dashboard:
+  enabled: true
   password: ""
 
 auth:
@@ -262,12 +276,48 @@ auth:
 
 ## Dashboard
 
-Visit `http://localhost:8080/panel` after starting:
+The dashboard is off by default (`/panel` returns 404 unless `dashboard.enabled: true`). Once enabled, visit `http://localhost:8080/panel`:
 
-- If `dashboard.password` is empty, the panel is open;
-- With a password set, login is required on first visit; session cookie is valid for 24 hours;
-- Shows available models, their provider/channel, and image support;
-- Shows account usage and price filtering.
+- `dashboard.enabled: true` turns it on; it requires `devin.token` to fetch model catalog, groups, and usage — otherwise it stays disabled (a hint is logged at startup);
+- `dashboard.password` has three modes:
+  - **empty (default)**: a random password is generated on every start and printed in the startup log (rotates on restart);
+  - **`"none"`**: open access — only for trusted localhost/intranet use;
+  - **any other string**: fixed password;
+- On login a session cookie is set, valid for 24 hours;
+- The panel has two tabs: **Stats** (requests/success rate/latency, input-output-cached token usage, 24h bar+line chart, last 20 requests with client IP and click-to-expand detail, uptime, per-model top) and **Models** (categories/providers, promo gift-icon popover with start/end/remaining/original-vs-current price, price filters, merge-by-family view);
+- Clicking a recent request expands request headers (sensitive headers like Authorization are never stored), request body and response — details are in-memory only, never persisted (capped at 48KB);
+- Stats are aggregated in memory and flushed to `stats.json` next to the config file every 5 minutes (merged on restart) plus once more on shutdown; the tab auto-refreshes every 15s.
+
+## Proxy pools & model routing
+
+The upstream serves a different model catalog per egress region: direct (CN) yields ~50 models; a US egress yields the full ~300 (`claude-*`, `gpt-*`, `gemini-*`, `grok-*`, `muse-*`, ...). So `devin.proxy` is also the **catalog egress** — set it to a US proxy to see everything, then route latency-sensitive models back to direct:
+
+```yaml
+devin:
+  proxy: "socks5://user:pass@us1.example.com:1080"  # US egress: full catalog + panel + unrouted models
+  proxy_pools:                    # arbitrary names; per-request round-robin (optional)
+    us:
+      - "socks5://user:pass@us1.example.com:1080"
+      - "socks5://user:pass@us2.example.com:1080"
+  routes:                         # top-down, first match wins
+    - models: ["swe-*", "glm-*", "kimi-*", "deepseek-*", "nemotron-*", "qwen-*", "minimax-*"]
+      pool: direct                # domestic models -> direct, low latency
+      # unmatched claude-*/gpt-*/gemini-* etc. -> devin.proxy US fallback
+```
+
+Or the inverse: leave `proxy` empty (catalog shows only region-visible models) and explicitly route US-only models to a pool:
+
+```yaml
+  routes:
+    - models: ["claude-*", "gpt-*", "gemini-*", "grok-*", "muse-*"]
+      pool: us
+```
+
+- Each `models` pattern matches the model **uid / display label / family / upstream group name**; `*` (any run) and `?` (single char) wildcards, case-insensitive; group matching needs the catalog (fetched on first request; on failure matching degrades to uid/label/family).
+- `pool` is a name from `proxy_pools`, or a reserved name: `direct` (direct connection), `default` (= `devin.proxy`).
+- Routes only apply to chat traffic (`/v1/*`); panel data and the model catalog always use `devin.proxy`.
+- Multiple addresses per pool rotate per request — good for "one egress, several entries"; reserve high-latency proxies for the few models that need them.
+- Changes take effect on restart. Keep `config.yaml` protected — proxy URLs may embed credentials.
 
 ## Notes
 
