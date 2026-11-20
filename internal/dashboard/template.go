@@ -860,8 +860,12 @@ const el=document.getElementById('recDetail'+i);
 if(el) el.style.display=el.style.display==='none'?'':'none';
 }
 
-// drawChart 绘制最近 24 小时：堆叠柱(输入+输出 token) + 折线(请求数)
+// 图表悬浮状态：数据与几何参数供 mousemove 重绘 tooltip
+let chartHours=[],chartGeom=null,chartHover=-1,chartBucketSrc=[];
+
+// drawChart 绘制最近 24 小时：堆叠柱(输入+输出 token) + 折线(请求数) + 悬浮 tooltip
 function drawChart(buckets){
+chartBucketSrc=buckets;
 const cv=document.getElementById('statChart');
 if(!cv) return;
 const dpr=window.devicePixelRatio||1;
@@ -879,13 +883,15 @@ const hours=[];
 for(let i=23;i>=0;i--){
 const k=now-i;
 const b=byHour[k]||{requests:0,input:0,output:0,cached:0};
-hours.push({k:k,r:b.requests||0,i:b.input||0,o:b.output||0});
+hours.push({k:k,r:b.requests||0,i:b.input||0,o:b.output||0,c:b.cached||0});
 }
+chartHours=hours;
 const maxTok=Math.max(1,...hours.map(x=>x.i+x.o));
 const maxReq=Math.max(1,...hours.map(x=>x.r));
 const padL=44,padR=44,padT=10,padB=20;
 const cw=(w-padL-padR)/24,bw=Math.min(cw*0.6,26);
 const chartH=h-padT-padB;
+chartGeom={padL:padL,padR:padR,padT:padT,padB:padB,cw:cw,chartH:chartH,w:w,h:h};
 // 网格线
 ctx.strokeStyle='#232a3a';ctx.lineWidth=1;
 ctx.fillStyle='#59637a';ctx.font='9px sans-serif';ctx.textAlign='left';
@@ -920,6 +926,48 @@ if(idx%6!==0) return;
 const d=new Date(b.k*3600000);
 ctx.fillText(String(d.getHours()).padStart(2,'0')+':00',padL+idx*cw+cw/2,h-6);
 });
+// 悬浮 tooltip 覆盖层
+drawChartHover(ctx);
+// 悬浮监听只需挂一次
+if(!cv._hoverBound){
+cv._hoverBound=true;
+cv.addEventListener('mousemove',e=>{
+const g=chartGeom;if(!g)return;
+const rect=cv.getBoundingClientRect();
+const idx=Math.floor((e.clientX-rect.left-g.padL)/g.cw);
+const next=(idx>=0&&idx<chartHours.length)?idx:-1;
+if(next!==chartHover){chartHover=next;drawChart(chartBucketSrc);}
+});
+cv.addEventListener('mouseleave',()=>{chartHover=-1;drawChart(chartBucketSrc);});
+}
+}
+
+// drawChartHover 在 chartHover 列上绘制高亮竖线与数据 tooltip
+function drawChartHover(ctx){
+const g=chartGeom;
+if(!g||chartHover<0||chartHover>=chartHours.length)return;
+const b=chartHours[chartHover];
+const cx=g.padL+chartHover*g.cw+g.cw/2;
+// 列高亮 + 竖线
+ctx.fillStyle='rgba(124,138,255,0.07)';
+ctx.fillRect(g.padL+chartHover*g.cw,g.padT,g.cw,g.chartH);
+ctx.strokeStyle='#7c8aff';ctx.lineWidth=1;
+ctx.beginPath();ctx.moveTo(cx,g.padT);ctx.lineTo(cx,g.padT+g.chartH);ctx.stroke();
+// tooltip
+const d=new Date(b.k*3600000);
+const lines=[(d.getMonth()+1)+'/'+d.getDate()+' '+String(d.getHours()).padStart(2,'0')+':00',
+'输入 '+fmtTok(b.i),'输出 '+fmtTok(b.o),'缓存 '+fmtTok(b.c),'请求 '+b.r];
+ctx.font='10px sans-serif';
+const tw=Math.max(...lines.map(l=>ctx.measureText(l).width))+18;
+const th=lines.length*15+10;
+let tx=cx+8;if(tx+tw>g.w-4)tx=cx-tw-8;
+const ty=g.padT+4;
+ctx.fillStyle='rgba(20,25,38,0.96)';
+ctx.fillRect(tx,ty,tw,th);
+ctx.strokeStyle='#3a4560';
+ctx.strokeRect(tx,ty,tw,th);
+ctx.fillStyle='#dde2ee';ctx.textAlign='left';
+lines.forEach((l,i)=>{ctx.fillText(l,tx+9,ty+17+i*15)});
 }
 
 function refreshAll(){loadStatus();loadModels();loadStats()}
