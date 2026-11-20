@@ -54,7 +54,7 @@ func TestMapStopReasonMaxNewlinesAndContentFilter(t *testing.T) {
 	if got := mapStopReason(devinproto.ExaCodeiumCommonPb_StopReason_ExaCodeiumCommonPb_StopReason_STOP_REASON_MAX_NEWLINES); got != llm.StopReasonLength {
 		t.Fatalf("MAX_NEWLINES = %q, want length", got)
 	}
-	if got := mapStopReason(devinproto.ExaCodeiumCommonPb_StopReason_ExaCodeiumCommonPb_StopReason_STOP_REASON_CONTENT_FILTER); got != llm.StopReasonError {
-		t.Fatalf("CONTENT_FILTER = %q, want error", got)
+	if got := mapStopReason(devinproto.ExaCodeiumCommonPb_StopReason_ExaCodeiumCommonPb_StopReason_STOP_REASON_CONTENT_FILTER); got != llm.StopReasonContentFilter {
+		t.Fatalf("CONTENT_FILTER = %q, want contentFilter", got)
 	}
 }

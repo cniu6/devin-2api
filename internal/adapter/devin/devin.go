@@ -55,9 +55,11 @@ type Config struct {
 
 // modelMeta 是模型目录中用于分流匹配的附加标识。
 type modelMeta struct {
-	label  string
-	family string
-	groups []string
+	label          string
+	family         string
+	groups         []string
+	supportsImages bool
+	hasImageInfo   bool
 }
 
 // Adapter 调用 Devin 的 ApiServerService/GetChatMessage。
@@ -129,7 +131,7 @@ func (adapter *Adapter) Stream(ctx context.Context, request llm.RequestMessages)
 	if model == "" {
 		model = adapter.config.Model
 	}
-	if err := validateImagesForModel(request, model); err != nil {
+	if err := adapter.validateImagesForModel(request, model); err != nil {
 		return nil, err
 	}
 	cfg := adapter.config
@@ -150,11 +152,18 @@ func (adapter *Adapter) Stream(ctx context.Context, request llm.RequestMessages)
 }
 
 // validateImagesForModel 在本地尽早拒绝「无视觉能力模型 + 图片」组合，错误信息对客户端可读。
-func validateImagesForModel(request llm.RequestMessages, model string) error {
+// 优先采信上游目录的 supports_images；目录未知时退到启发式名单。
+func (adapter *Adapter) validateImagesForModel(request llm.RequestMessages, model string) error {
 	if !requestHasImages(request) {
 		return nil
 	}
-	if !modelLikelySupportsImages(model) {
+	supported := modelLikelySupportsImages(model)
+	adapter.modelsMu.RLock()
+	if meta, ok := adapter.modelMeta[model]; ok && meta.hasImageInfo {
+		supported = meta.supportsImages
+	}
+	adapter.modelsMu.RUnlock()
+	if !supported {
 		return fmt.Errorf("model %q does not support image inputs (supports_images=false); use a vision-capable model or remove images", model)
 	}
 	return nil
@@ -314,7 +323,7 @@ func (a *Adapter) catalog(ctx context.Context) ([]adapter.ModelInfo, map[string]
 		if uid == "" {
 			return
 		}
-		m := modelMeta{label: c.GetLabel(), groups: labelGroups[c.GetLabel()]}
+		m := modelMeta{label: c.GetLabel(), groups: labelGroups[c.GetLabel()], supportsImages: c.GetSupportsImages(), hasImageInfo: true}
 		if fm := c.GetModelFamilyMetadata(); fm != nil {
 			m.family = fm.GetModelFamilyLabel()
 		}

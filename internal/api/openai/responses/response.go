@@ -593,7 +593,7 @@ func responseStatus(reason llm.StopReason) string {
 	if reason == llm.StopReasonLength {
 		return "incomplete"
 	}
-	if reason == llm.StopReasonError || reason == llm.StopReasonAborted {
+	if reason == llm.StopReasonError || reason == llm.StopReasonAborted || reason == llm.StopReasonContentFilter {
 		return "failed"
 	}
 	return "completed"

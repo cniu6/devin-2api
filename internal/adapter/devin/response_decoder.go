@@ -2,6 +2,7 @@
 package devin
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -46,6 +47,8 @@ type responseDecoder struct {
 	hasStopReason bool
 	// stopReason 保存 Devin 声明的最终停止原因，等待上游 EOF 后用于完成响应。
 	stopReason llm.StopReason
+	// providerRefusal 表示上游供应商在 usage 中标记了拒答。
+	providerRefusal bool
 }
 
 // toolState 保存一次 Devin 工具调用的累计状态。
@@ -150,6 +153,22 @@ func (decoder *responseDecoder) updateMetadata(response *devinproto.GetChatMessa
 			decoder.partial.Usage.CacheWrite = int64(usage.GetCacheWriteTokens())
 		}
 		decoder.partial.Usage.TotalTokens = decoder.partial.Usage.Input + decoder.partial.Usage.Output + decoder.partial.Usage.CacheRead + decoder.partial.Usage.CacheWrite
+		// 供应商明确拒答（provider_refusal）按内容过滤语义上报，
+		// 而不是任由默认 stop 掩盖拦截事实。
+		if usage.GetProviderRefusal() {
+			decoder.providerRefusal = true
+		}
+	}
+	// 上游按帧下发的 Gemini 思考签名属于最后打开的工具调用；重放需要原样回传。
+	if sig := response.GetGeminiThoughtSignature(); len(sig) > 0 && len(decoder.tools) > 0 {
+		state := decoder.tools[len(decoder.tools)-1]
+		state.call.ThoughtSignature = base64.StdEncoding.EncodeToString(sig)
+		decoder.partial.Content[state.contentIdx] = state.call
+	}
+	if cost := response.GetCommittedCreditCost(); cost != 0 {
+		decoder.partial.Usage.CreditCost = int64(cost)
+	} else if cost := response.GetCreditCost(); cost != 0 {
+		decoder.partial.Usage.CreditCost = int64(cost)
 	}
 }
 
@@ -290,6 +309,10 @@ func (decoder *responseDecoder) complete(reason llm.StopReason) []llm.ResponseEv
 		return nil
 	}
 	events := make([]llm.ResponseEvent, 0, len(decoder.tools)*3+3)
+	// 供应商拒答优先于普通结束，如实上报拦截而不是谎报 stop。
+	if decoder.providerRefusal && (reason == llm.StopReasonStop || reason == llm.StopReasonPending || reason == "") {
+		reason = llm.StopReasonContentFilter
+	}
 	decoder.partial.StopReason = reason
 	events = append(events, decoder.endThinking()...)
 	events = append(events, decoder.endText()...)
@@ -333,10 +356,11 @@ func mapStopReason(reason devinproto.ExaCodeiumCommonPb_StopReason) llm.StopReas
 		return llm.StopReasonLength
 	case devinproto.ExaCodeiumCommonPb_StopReason_ExaCodeiumCommonPb_StopReason_STOP_REASON_FUNCTION_CALL:
 		return llm.StopReasonToolUse
+	case devinproto.ExaCodeiumCommonPb_StopReason_ExaCodeiumCommonPb_StopReason_STOP_REASON_CONTENT_FILTER:
+		return llm.StopReasonContentFilter
 	case devinproto.ExaCodeiumCommonPb_StopReason_ExaCodeiumCommonPb_StopReason_STOP_REASON_ERROR,
-		devinproto.ExaCodeiumCommonPb_StopReason_ExaCodeiumCommonPb_StopReason_STOP_REASON_CONTENT_FILTER,
 		devinproto.ExaCodeiumCommonPb_StopReason_ExaCodeiumCommonPb_StopReason_STOP_REASON_NONFINITE_LOGIT_OR_PROB:
-		// 内容过滤/异常终止是失败而非正常结束。
+		// 异常终止是失败而非正常结束。
 		return llm.StopReasonError
 	default:
 		return llm.StopReasonStop

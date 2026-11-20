@@ -19,6 +19,9 @@ const (
 	StopReasonToolUse StopReason = "toolUse"
 	StopReasonError   StopReason = "error"
 	StopReasonAborted StopReason = "aborted"
+	// StopReasonContentFilter 表示生成被上游内容安全策略拦截；
+	// 必须与普通错误区分，各协议才能如实映射（content_filter/refusal）。
+	StopReasonContentFilter StopReason = "contentFilter"
 )
 
 // AssistantMessage 表示供应商无关的助手消息，也是最终响应消息。
@@ -82,6 +85,8 @@ type Usage struct {
 	TotalTokens int64
 	// Cost 是按统一币种归一化后的费用明细。
 	Cost UsageCost
+	// CreditCost 是上游按 credit 计费的本次消耗；0 表示供应商未提供。
+	CreditCost int64
 }
 
 // Validate 检查用量字段均为非负值。
@@ -269,7 +274,7 @@ func requireIndexedPartial(event ResponseEvent) error {
 
 func (reason StopReason) valid() bool {
 	switch reason {
-	case StopReasonPending, StopReasonStop, StopReasonLength, StopReasonToolUse, StopReasonError, StopReasonAborted:
+	case StopReasonPending, StopReasonStop, StopReasonLength, StopReasonToolUse, StopReasonError, StopReasonAborted, StopReasonContentFilter:
 		return true
 	default:
 		return false

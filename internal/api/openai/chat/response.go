@@ -403,8 +403,10 @@ func finishReason(reason llm.StopReason) any {
 		return "length"
 	case llm.StopReasonStop:
 		return "stop"
-	case llm.StopReasonError, llm.StopReasonAborted:
+	case llm.StopReasonContentFilter:
 		return "content_filter"
+	case llm.StopReasonError, llm.StopReasonAborted:
+		return nil
 	default:
 		return nil
 	}

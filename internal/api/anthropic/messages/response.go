@@ -360,8 +360,12 @@ func anthropicStopReason(reason llm.StopReason) any {
 		return "max_tokens"
 	case llm.StopReasonStop:
 		return "end_turn"
+	case llm.StopReasonContentFilter:
+		return "refusal"
 	case llm.StopReasonError, llm.StopReasonAborted:
-		return "error"
+		// Anthropic 合法枚举里没有通用 error；"refusal" 是最接近的合法值，
+		// 此前输出的 "error" 会被 SDK 校验直接拒绝。
+		return "refusal"
 	default:
 		return nil
 	}

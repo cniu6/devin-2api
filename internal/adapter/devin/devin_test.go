@@ -137,17 +137,18 @@ func TestValidateImagesForModelRejectsGLM(t *testing.T) {
 			llm.ImageContent{Data: "AAAA", MIMEType: "image/png"},
 		}}},
 	}
-	err := validateImagesForModel(request, "glm-5-2")
+	emptyAdapter := &Adapter{}
+	err := emptyAdapter.validateImagesForModel(request, "glm-5-2")
 	if err == nil {
 		t.Fatal("expected error for glm-5-2 + image")
 	}
 	if !strings.Contains(err.Error(), "does not support image") {
 		t.Fatalf("error = %v, want does not support image", err)
 	}
-	if err := validateImagesForModel(request, "swe-1-7"); err != nil {
+	if err := emptyAdapter.validateImagesForModel(request, "swe-1-7"); err != nil {
 		t.Fatalf("swe-1-7 should allow images: %v", err)
 	}
-	if err := validateImagesForModel(llm.RequestMessages{Model: "glm-5-2", Messages: []llm.Message{
+	if err := emptyAdapter.validateImagesForModel(llm.RequestMessages{Model: "glm-5-2", Messages: []llm.Message{
 		llm.UserMessage{Content: []llm.Content{llm.TextContent{Text: "hi"}}},
 	}}, "glm-5-2"); err != nil {
 		t.Fatalf("text-only glm should pass: %v", err)
