@@ -84,3 +84,23 @@ func TestResponsesStoresSessionAfterSuccess(t *testing.T) {
 		t.Fatal("a successful response must be remembered for the next chained turn")
 	}
 }
+
+// store:false 是调用方明确拒绝服务端保留会话：既不写进 responses store，
+// 响应体里的 store 字段也要如实回显 false（见 PR#2）。
+func TestResponsesStoreFalseNotRetained(t *testing.T) {
+	application := newResponsesTestApp(okFinal())
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses",
+		strings.NewReader(`{"model":"gpt-test","store":false,"input":"hello"}`))
+	response := httptest.NewRecorder()
+	application.Router().ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	if application.responses.Len() != 0 {
+		t.Fatal("store:false must not retain the exchange server-side")
+	}
+	if !strings.Contains(response.Body.String(), `"store":false`) {
+		t.Fatalf("response must echo store:false, got %s", response.Body.String())
+	}
+}
