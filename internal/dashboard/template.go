@@ -162,6 +162,7 @@ tr.fam:hover td{background:#171e30}
 .cat-fam{background:#16283a;border-color:#24506e;color:#7dd3fc}
 .price{font-variant-numeric:tabular-nums;white-space:nowrap}
 .price.ok{color:var(--green)}
+.price-disc{color:#c084fc}
 .muted{color:var(--faint)}
 .loading{text-align:center;padding:26px;color:var(--mut)}
 .note{font-size:11px;color:var(--mut);line-height:1.6;margin-top:8px}
@@ -274,7 +275,7 @@ tr.fam:hover td{background:#171e30}
 <strong>价格说明：</strong>
 <code>倍率</code> 是每请求消耗 credit 数；FREE 是上游定价等级名（≠0 消耗，如 SWE-2 free 仍按 x4~x12 计），倍率 0 才在最终价格显示"免费"，未下发按基准 ≈1 计。
 <code>Input / Cached / Output</code> 为上游 <code>model_dimensions</code> 下发的 $/1M tokens 参考价。
-<code>最终价格</code> = 每请求倍率 + 进出价合并区间（含 effort 低~高浮动）。
+<code>最终价格</code> = 有效单价（$输入 / $输出 /1M，与 IDE picker 同源）；<span class="price-disc">紫色</span>为促销折后价；无美元维度显示每请求倍率 xN。
 <code>分类</code> 来自上游 picker 分组（client_model_sorts）与模型系列；促销模型名称旁的 🎁 悬浮显示优惠详情。
 计费类型：STATIC_CREDIT=固定 credit、API=按 API、BYOK=自带 Key、ACU_*=ACU 计费。
 </div>
@@ -466,24 +467,38 @@ o:o||(m.price_output!=null?{lo:+m.price_output,hi:+m.price_output}:null)
 }
 function fmtR(r){return r?(r.lo===r.hi?('$'+fmtP(r.lo)):('$'+fmtP(r.lo)+'~'+fmtP(r.hi))):'—'}
 
-// finalPrice 合成"最终价格"：每请求 credit 倍率 + 进出价区间
+// dimVal 取维度基准单价（IDE 展示的 $/1M 值，非 effort 浮动区间）
+function dimVal(m,kind){
+const d=dimOf(m,kind);
+return d?Number(d.value):null;
+}
+// discountFactor 促销折扣系数：1=无促销；解析 label "83% off"/"7折" 得折后比例
+function discountFactor(m){
+return 1-(discountRate(m.promo&&m.promo.label)||0);
+}
+// finalPrice 显示最终有效单价：$输入/$输出（促销价已折进，紫色标出）；
+// 无美元维度回退每请求倍率 xN；free 且 0 倍率显示"免费"。
 function finalPrice(m){
 if(/BYOK/.test(m.pricing_type||'')) return '<span class="price">BYOK</span>';
 if(m.cost_tier==='free'&&(!m.credit_multiplier||m.credit_multiplier===0)) return '<span class="price ok">免费</span>';
-const pr=m._pr||prOf(m);
-const parts=[];
-if(m.credit_multiplier>0) parts.push('x'+trimN(m.credit_multiplier));
-else if(!m.multiplier_known) parts.push('≈x1');
-if(pr.i||pr.o) parts.push(fmtR(pr.i)+'/'+fmtR(pr.o));
-if(!parts.length) return '<span class="muted">—</span>';
-return '<span class="price">'+parts.join(' ')+'</span>';
+const s=discountFactor(m);
+const iv=dimVal(m,'input'),ov=dimVal(m,'output');
+if(iv!=null||ov!=null){
+const a=iv!=null?('$'+fmtP(iv*s)):'—';
+const b=ov!=null?('$'+fmtP(ov*s)):'—';
+return '<span class="price'+(s<1?' price-disc':'')+'">'+a+' / '+b+'</span>';
 }
-// repPrice 用于最终价格排序的代表值：优先 Output 高价
+if(m.credit_multiplier>0) return '<span class="price'+(s<1?' price-disc':'')+'">x'+trimN(m.credit_multiplier*s)+'</span>';
+return '<span class="price">≈x1</span>';
+}
+// repPrice 用于最终价格排序的代表值：折后 Output 单价优先
 function repPrice(m){
-const pr=m._pr||prOf(m);
-if(pr.o) return pr.o.hi;
-if(pr.i) return pr.i.hi;
-if(m.credit_multiplier>0) return Number(m.credit_multiplier);
+const s=discountFactor(m);
+const o=dimVal(m,'output');
+if(o!=null) return o*s;
+const i=dimVal(m,'input');
+if(i!=null) return i*s;
+if(m.credit_multiplier>0) return Number(m.credit_multiplier)*s;
 return (m.cost_tier==='free'&&(!m.credit_multiplier||m.credit_multiplier===0))?0:null;
 }
 
@@ -528,20 +543,11 @@ const zhe=/(\d+(?:\.\d+)?)\s*折/.exec(label||'');
 if(zhe) return 1-Number(zhe[1])/10;
 return null;
 }
-// origPrice 由折扣率反推原价：现价 = 原价 × (1-折扣率)
-function origPrice(m){
-const disc=discountRate(m.promo&&m.promo.label);
-if(!disc||disc>=1) return null;
-const scale=1/(1-disc);
-const pr=m._pr||prOf(m);
-const parts=[];
-if(m.credit_multiplier>0) parts.push('x'+trimN(m.credit_multiplier*scale));
-if(pr.i||pr.o){
-const ri=pr.i?('$'+fmtP(pr.i.lo*scale)+(pr.i.lo===pr.i.hi?'':'~'+fmtP(pr.i.hi*scale))):'—';
-const ro=pr.o?('$'+fmtP(pr.o.lo*scale)+(pr.o.lo===pr.o.hi?'':'~'+fmtP(pr.o.hi*scale))):'—';
-parts.push(ri+'/'+ro);
-}
-return parts.length?parts.join(' '):null;
+// pricePair 格式化 $输入/$输出 单价对（scale 为折扣系数，1=原价）
+function pricePair(m,scale){
+const iv=dimVal(m,'input'),ov=dimVal(m,'output');
+if(iv==null&&ov==null) return null;
+return (iv!=null?('$'+fmtP(iv*scale)):'—')+' / '+(ov!=null?('$'+fmtP(ov*scale)):'—');
 }
 const GIFT_SVG='<svg viewBox="0 0 24 24" fill="none" stroke="#c084fc" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="8" width="18" height="4" rx="1"/><path d="M12 8v13"/><path d="M19 12v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-7"/><path d="M7.5 8a2.5 2.5 0 0 1 0-5C11 3 12 8 12 8s1-5 4.5-5a2.5 2.5 0 0 1 0 5"/></svg>';
 // giftIcon 在模型名旁渲染礼物图标，悬浮显示促销详情（起止/剩余/原价划线/现价）
@@ -554,12 +560,13 @@ pop+='<div class="pt">'+(m.promo.label?esc(m.promo.label):'限时优惠')+'</div
 pop+='<div><span class="pk">开始</span>—</div>';
 pop+='<div><span class="pk">到期</span>'+(end?end.toLocaleString():'—')+'</div>';
 pop+='<div><span class="pk">剩余</span>'+(pi&&pi.tail?esc(pi.tail.slice(1)):'—')+'</div>';
-const orig=origPrice(m);
+const disc=discountRate(m.promo.label||'');
+if(disc){
+const orig=pricePair(m,1)||(m.credit_multiplier>0?('x'+trimN(m.credit_multiplier)):null);
 if(orig) pop+='<div><span class="pk">原价</span><span class="strike">'+orig+'</span></div>';
-const pr=m._pr||prOf(m),cur=[];
-if(m.credit_multiplier>0) cur.push('x'+trimN(m.credit_multiplier));
-if(pr.i||pr.o) cur.push(fmtR(pr.i)+'/'+fmtR(pr.o));
-if(cur.length) pop+='<div><span class="pk">现价</span>'+cur.join(' ')+'</div>';
+}
+const curPair=pricePair(m,discountFactor(m))||(m.credit_multiplier>0?('x'+trimN(m.credit_multiplier*discountFactor(m))):null);
+if(curPair) pop+='<div><span class="pk">现价</span><span class="price-disc">'+curPair+'</span></div>';
 pop+='</div>';
 return '<span class="gift">'+GIFT_SVG+pop+'</span>';
 }
@@ -741,8 +748,21 @@ html+='<td>'+(multLo===multHi?('x'+trimN(multLo)):('x'+trimN(multLo)+'~'+trimN(m
 html+='<td><span class="price">'+(priceAgg.i?fmtR(priceAgg.i):'—')+'</span></td>';
 html+='<td><span class="price">'+(priceAgg.c?fmtR(priceAgg.c):'—')+'</span></td>';
 html+='<td><span class="price">'+(priceAgg.o?fmtR(priceAgg.o):'—')+'</span></td>';
-// 家族最终价格：倍率区间 + 价格区间
-html+='<td>'+(one?finalPrice(m):('<span class="price">'+(multLo===multHi?('x'+trimN(multLo)):('x'+trimN(multLo)+'~'+trimN(multHi)))+' '+fmtR(priceAgg.i)+'/'+fmtR(priceAgg.o)+'</span>'))+'</td>';
+// 家族最终价格：成员折后 $ 输入/输出区间；无美元维度回退倍率区间
+let famPrice='';
+if(!one){
+const ivs=mem.map(x=>{const v=dimVal(x,'input');return v!=null?v*discountFactor(x):null}).filter(v=>v!=null);
+const ovs=mem.map(x=>{const v=dimVal(x,'output');return v!=null?v*discountFactor(x):null}).filter(v=>v!=null);
+const anyDisc=mem.some(x=>discountFactor(x)<1);
+if(ivs.length||ovs.length){
+const ri=ivs.length?(Math.min(...ivs)===Math.max(...ivs)?('$'+fmtP(ivs[0])):('$'+fmtP(Math.min(...ivs))+'~'+fmtP(Math.max(...ivs)))):'—';
+const ro=ovs.length?(Math.min(...ovs)===Math.max(...ovs)?('$'+fmtP(ovs[0])):('$'+fmtP(Math.min(...ovs))+'~'+fmtP(Math.max(...ovs)))):'—';
+famPrice='<span class="price'+(anyDisc?' price-disc':'')+'">'+ri+' / '+ro+'</span>';
+}else{
+famPrice='<span class="price">'+(multLo===multHi?('x'+trimN(multLo)):('x'+trimN(multLo)+'~'+trimN(multHi)))+'</span>';
+}
+}
+html+='<td>'+(one?finalPrice(m):famPrice)+'</td>';
 html+='<td class="mono">'+esc(pricings.join(' / ')||'-')+'</td>';
 html+='<td>'+badges(m)+(one?'':'<div class="muted" style="font-size:10px;margin-top:2px">'+mem.slice(1).map(x=>esc(x.label||x.uid)).join(' · ')+'</div>')+'</td>';
 html+='</tr>';
