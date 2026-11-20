@@ -36,6 +36,8 @@ type RequestMessages struct {
 	Model string
 	// SystemPrompt 是独立于普通消息历史的系统提示词。
 	SystemPrompt string
+	// SystemCacheControl 表示调用方要求缓存系统提示词（Anthropic cache_control）。
+	SystemCacheControl bool
 	// Messages 是按时间顺序排列、可跨供应商重放的完整对话历史。
 	Messages []Message
 	// Tools 是本次请求允许模型调用的工具定义。
@@ -56,6 +58,8 @@ type RequestMessages struct {
 	StopPatterns []string
 	// Seed 是可选的采样种子；nil 表示由上游自行选择。
 	Seed *int64
+	// ServiceTier 是可选的服务等级（OpenAI service_tier）；空表示上游默认。
+	ServiceTier string
 }
 
 // ToolChoiceMode 描述工具调用约束的模式。
@@ -188,6 +192,8 @@ type UserMessage struct {
 	Content []Content
 	// TimestampMS 是创建消息时的 Unix 毫秒时间戳。
 	TimestampMS int64
+	// CacheControl 表示调用方把本条消息标记为提示缓存断点。
+	CacheControl bool
 }
 
 // Role 返回用户角色。
@@ -216,6 +222,8 @@ type ToolResultMessage struct {
 	IsError bool
 	// TimestampMS 是创建消息时的 Unix 毫秒时间戳。
 	TimestampMS int64
+	// CacheControl 表示调用方把本条消息标记为提示缓存断点。
+	CacheControl bool
 }
 
 // Role 返回工具结果角色。

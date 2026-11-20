@@ -28,6 +28,7 @@ type Request struct {
 	Seed                *int64          `json:"seed,omitempty"`
 	ParallelToolCalls   *bool           `json:"parallel_tool_calls,omitempty"`
 	ResponseFormat      json.RawMessage `json:"response_format,omitempty"`
+	ServiceTier         string          `json:"service_tier,omitempty"`
 }
 
 // Message 是 Chat Completions 消息条目。
@@ -141,6 +142,8 @@ func DecodeRequest(data []byte) (AdaptedRequest, error) {
 		return AdaptedRequest{}, fmt.Errorf("tool_choice: %w", err)
 	}
 	context.ToolChoice = toolChoice
+	context.ServiceTier = request.ServiceTier
+	context.SystemPrompt = common.AppendSystemInstruction(context.SystemPrompt, common.ResponseFormatInstruction(request.ResponseFormat))
 	return AdaptedRequest{
 		Context: context,
 		Options: RequestOptions{
@@ -185,6 +188,9 @@ func appendMessage(context *llm.RequestMessages, message Message) error {
 			return err
 		}
 		text := common.ContentText(content)
+		if common.HasCacheControl(message.Content) {
+			context.SystemCacheControl = true
+		}
 		if context.SystemPrompt != "" && text != "" {
 			context.SystemPrompt += "\n"
 		}
@@ -195,8 +201,9 @@ func appendMessage(context *llm.RequestMessages, message Message) error {
 			return err
 		}
 		context.Messages = append(context.Messages, llm.UserMessage{
-			Content:     content,
-			TimestampMS: time.Now().UnixMilli(),
+			Content:      content,
+			TimestampMS:  time.Now().UnixMilli(),
+			CacheControl: common.HasCacheControl(message.Content),
 		})
 	case "assistant":
 		content, err := decodeAssistantContent(message)
@@ -204,8 +211,9 @@ func appendMessage(context *llm.RequestMessages, message Message) error {
 			return err
 		}
 		context.Messages = append(context.Messages, llm.AssistantMessage{
-			Content:     content,
-			TimestampMS: time.Now().UnixMilli(),
+			Content:      content,
+			TimestampMS:  time.Now().UnixMilli(),
+			CacheControl: common.HasCacheControl(message.Content),
 		})
 	case "tool":
 		if message.ToolCallID == "" {
@@ -220,10 +228,11 @@ func appendMessage(context *llm.RequestMessages, message Message) error {
 			return err
 		}
 		context.Messages = append(context.Messages, llm.ToolResultMessage{
-			ToolCallID:  message.ToolCallID,
-			ToolName:    name,
-			Content:     content,
-			TimestampMS: time.Now().UnixMilli(),
+			ToolCallID:   message.ToolCallID,
+			ToolName:     name,
+			Content:      content,
+			TimestampMS:  time.Now().UnixMilli(),
+			CacheControl: common.HasCacheControl(message.Content),
 		})
 	default:
 		// 忽略未知角色。

@@ -109,6 +109,8 @@ func (application *App) Router() http.Handler {
 		protected.Get("/v1/models/{model}", application.getModel)
 		protected.Get("/v1/responses", application.createResponsesWebSocket)
 		protected.Post("/v1/responses", application.createResponses)
+		protected.Get("/v1/responses/{id}", application.getResponse)
+		protected.Delete("/v1/responses/{id}", application.deleteResponse)
 		protected.Post("/v1/chat/completions", application.createChatCompletions)
 		protected.Post("/v1/messages", application.createMessages)
 		protected.Post("/v1/audio/transcriptions", application.createTranscription)
@@ -313,7 +315,56 @@ func (application *App) apiKeyMiddleware(next http.Handler) http.Handler {
 }
 
 func (application *App) createResponses(writer http.ResponseWriter, request *http.Request) {
-	application.createCompletion(writer, request, decodeResponsesRequest, responsesProtocol{})
+	var resolve respproto.ItemResolver
+	if application.responses != nil {
+		caller := application.callerKey()
+		resolve = func(id string) (json.RawMessage, bool) {
+			raw, ok := application.responses.GetItem(caller, id)
+			return raw, ok
+		}
+	}
+	application.createCompletion(writer, request, decodeResponsesRequestWith(resolve), responsesProtocol{})
+}
+
+// callerKey 是 Responses 会话存储的租户键（单 API key 部署下即该 key）。
+func (application *App) callerKey() string {
+	if application.apiKey == "" {
+		return "default"
+	}
+	return application.apiKey
+}
+
+// getResponse 实现 GET /v1/responses/{id}：回放已保存（store 未关闭）的 Response 对象。
+func (application *App) getResponse(writer http.ResponseWriter, request *http.Request) {
+	id := chi.URLParam(request, "id")
+	if application.responses != nil {
+		if body, ok := application.responses.GetResponse(application.callerKey(), id); ok {
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = writer.Write(body)
+			return
+		}
+	}
+	writeResponseNotFound(writer, id)
+}
+
+// deleteResponse 实现 DELETE /v1/responses/{id}：删除会话及其 output item 索引。
+func (application *App) deleteResponse(writer http.ResponseWriter, request *http.Request) {
+	id := chi.URLParam(request, "id")
+	if application.responses == nil || !application.responses.Delete(application.callerKey(), id) {
+		writeResponseNotFound(writer, id)
+		return
+	}
+	writer.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(writer).Encode(map[string]any{"id": id, "object": "response.deleted", "deleted": true})
+}
+
+func writeResponseNotFound(writer http.ResponseWriter, id string) {
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(http.StatusNotFound)
+	_ = json.NewEncoder(writer).Encode(map[string]any{"error": map[string]any{
+		"message": fmt.Sprintf("Response with id '%s' not found.", id),
+		"type":    "invalid_request_error", "param": nil, "code": "not_found",
+	}})
 }
 
 func (application *App) createChatCompletions(writer http.ResponseWriter, request *http.Request) {
@@ -439,7 +490,7 @@ func (application *App) createCompletion(
 			writeLoggedError(writer, recorder, "previous_response_id", completion.StatusCode, historyErr)
 			return
 		}
-		messages = merged
+		messages = respproto.ResolvePendingToolNames(merged)
 		switch {
 		case resolution.Injected:
 			recorder.WriteJSON("02b-history-injected.json", map[string]any{
@@ -552,7 +603,7 @@ func (application *App) rememberResponsesExchange(
 	history := make([]llm.Message, 0, len(requestMessages.Messages)+1)
 	history = append(history, requestMessages.Messages...)
 	history = append(history, *reply)
-	application.responses.PutWithID(caller, projection.ID, history)
+	application.responses.PutResponse(caller, projection.ID, history, encoded)
 }
 
 // sensitiveHeaders 不计入「最近请求」详情的请求头（含密钥）。
@@ -850,7 +901,11 @@ func (application *App) rememberStreamExchange(
 	history := make([]llm.Message, 0, len(requestMessages.Messages)+1)
 	history = append(history, requestMessages.Messages...)
 	history = append(history, *reply)
-	application.responses.PutWithID(caller, responseID, history)
+	var final []byte
+	if finalProvider, ok := encoder.(interface{ FinalResponse() []byte }); ok {
+		final = finalProvider.FinalResponse()
+	}
+	application.responses.PutResponse(caller, responseID, history, final)
 }
 
 // encodeFinal 编码非流式响应。

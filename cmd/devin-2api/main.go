@@ -45,13 +45,14 @@ func main() {
 	providerAdapter := adapter.Adapter(adapter.Unavailable{Reason: "provider adapter is not configured"})
 	if serviceConfig.Devin.Token != "" {
 		configured, createErr := devin.New(devin.Config{
-			BaseURL:    serviceConfig.Devin.BaseURL,
-			Token:      serviceConfig.Devin.Token,
-			Model:      serviceConfig.Devin.Model,
-			Proxy:      serviceConfig.Devin.Proxy,
-			ProxyPools: proxyPoolsMap(serviceConfig.Devin.ProxyPools),
-			Routes:     proxyRoutes(serviceConfig.Devin.Routes),
-			ForceHTTP1: serviceConfig.Devin.ForceHTTP1 != nil && *serviceConfig.Devin.ForceHTTP1,
+			BaseURL:     serviceConfig.Devin.BaseURL,
+			Token:       serviceConfig.Devin.Token,
+			Model:       serviceConfig.Devin.Model,
+			Proxy:       serviceConfig.Devin.Proxy,
+			ProxyPools:  proxyPoolsMap(serviceConfig.Devin.ProxyPools),
+			Routes:      proxyRoutes(serviceConfig.Devin.Routes),
+			ForceHTTP1:  serviceConfig.Devin.ForceHTTP1 != nil && *serviceConfig.Devin.ForceHTTP1,
+			MaxNewlines: serviceConfig.Devin.MaxNewlines,
 		})
 		if createErr != nil {
 			log.Fatal(createErr)

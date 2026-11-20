@@ -31,7 +31,7 @@ type HistoryResolution struct {
 // server-side state retention"）：
 //
 //   - previousResponseID 为空 —— 原样返回。
-//   - 请求已自带多轮历史（len(Messages) > 1）—— **不注入**，原样返回。
+//   - 请求已自带助手轮次（含 AssistantMessage）—— **不注入**，原样返回。
 //     现有客户端全都这样用；对它们而言本次改动完全无感，也不会因为带了一个
 //     早已过期的 id 而突然收到 400。
 //   - 请求只有单条消息（真正的"只发本轮"链式调用）且 id 可解析 —— 前置注入历史。
@@ -50,8 +50,10 @@ func WithHistory(
 	if previousResponseID == "" {
 		return context, resolution, nil
 	}
-	// 客户端已自带完整历史：尊重它，不叠加服务端状态。
-	if len(context.Messages) > 1 {
+	// 客户端已自带完整历史（请求里出现了助手轮次）：尊重它，不叠加服务端状态。
+	// 只按条数判断（>1 即跳过）是错的：Codex 链式调用的一轮常是多条
+	// function_call_output 或多条用户消息，它们恰恰最需要补齐历史。
+	if clientSuppliedHistory(context.Messages) {
 		resolution.ClientSuppliedFullHistory = true
 		return context, resolution, nil
 	}
@@ -74,4 +76,14 @@ func WithHistory(
 	resolution.Injected = true
 	resolution.HistoryCount = len(history)
 	return context, resolution, nil
+}
+
+// clientSuppliedHistory 报告请求是否已自带助手轮次（即完整历史）。
+func clientSuppliedHistory(messages []llm.Message) bool {
+	for _, message := range messages {
+		if _, ok := message.(llm.AssistantMessage); ok {
+			return true
+		}
+	}
+	return false
 }

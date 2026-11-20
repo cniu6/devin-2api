@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"time"
@@ -84,6 +85,18 @@ func (w *wsResponseWriter) flushRemainder() {
 	if len(rest) == 0 {
 		return
 	}
+	// HTTP 错误体是 {"error":{...}}；WebSocket 契约要求带 "type":"error"，客户端才能识别。
+	var envelope map[string]json.RawMessage
+	if json.Unmarshal(rest, &envelope) == nil {
+		if _, typed := envelope["type"]; !typed {
+			if _, isError := envelope["error"]; isError {
+				envelope["type"] = json.RawMessage(`"error"`)
+				if wrapped, err := json.Marshal(envelope); err == nil {
+					rest = wrapped
+				}
+			}
+		}
+	}
 	if err := w.conn.WriteMessage(websocket.TextMessage, rest); err != nil {
 		w.err = err
 	}
@@ -108,8 +121,12 @@ func (w *wsResponseWriter) writeFrame(frame []byte) error {
 	return w.conn.WriteMessage(websocket.TextMessage, data)
 }
 
+// wsIdleTimeout 是 WebSocket 连接两轮请求之间允许的最长空闲时间。
+const wsIdleTimeout = 10 * time.Minute
+
 // responsesWebSocket 处理 OpenAI Responses WebSocket 连接。
-// 只处理单轮 response.create；多轮 response.append 可在此基础上扩展。
+// 一条连接承载多轮 response.create（Codex 会复用连接并以 previous_response_id 串联），
+// 每轮按顺序处理；连接断开会取消正在进行的上游流。
 func (application *App) responsesWebSocket(writer http.ResponseWriter, request *http.Request) {
 	conn, err := upgrader.Upgrade(writer, request, nil)
 	if err != nil {
@@ -118,72 +135,111 @@ func (application *App) responsesWebSocket(writer http.ResponseWriter, request *
 	}
 	defer conn.Close()
 
-	// 设置 WebSocket 读/写超时，避免死连接长期占用。
-	_ = conn.SetReadDeadline(time.Now().Add(600 * time.Second))
-	_ = conn.SetWriteDeadline(time.Now().Add(600 * time.Second))
+	connCtx, cancelConn := context.WithCancel(request.Context())
+	defer cancelConn()
 
-	// 读取第一条 response.create 消息。
-	messageType, body, err := conn.ReadMessage()
-	if err != nil {
-		log.Printf("websocket read failed: %v", err)
-		return
-	}
-	if messageType != websocket.TextMessage {
-		log.Printf("websocket received non-text message type %d", messageType)
-		return
-	}
-
-	// OpenAI WebSocket 模式不写 stream 字段，等价于 stream=true。
-	// 把 body 解析后强制加上 stream=true，确保走流式分支。
-	var payload map[string]any
-	if err := json.Unmarshal(body, &payload); err != nil {
-		log.Printf("websocket parse request failed: %v", err)
-		return
-	}
-	// OpenAI 包装格式 {"type":"response.create"|"response.append","response":{...}}：
-	// 真正的请求字段在 response 子对象里；不解包会因缺 model 解码失败（且错误静默）。
-	if inner, ok := payload["response"].(map[string]any); ok && payload["type"] != nil {
-		payload = inner
-	}
-	payload["stream"] = true
-	body, err = json.Marshal(payload)
-	if err != nil {
-		log.Printf("websocket encode request failed: %v", err)
-		return
-	}
-
-	// 构造一个内部 POST /v1/responses 请求，让现有 createResponses 处理。
-	ctx, cancel := context.WithCancel(request.Context())
-	defer cancel()
-
-	// 监听连接关闭，及时取消上游流。
+	// 单一读协程：gorilla 只允许一个并发读者。读失败（断开/超时）即取消整条连接。
+	incoming := make(chan []byte, 8)
 	go func() {
+		defer close(incoming)
 		for {
-			_, _, err := conn.ReadMessage()
+			_ = conn.SetReadDeadline(time.Now().Add(wsIdleTimeout))
+			messageType, body, err := conn.ReadMessage()
 			if err != nil {
-				cancel()
+				cancelConn()
+				return
+			}
+			if messageType != websocket.TextMessage {
+				continue
+			}
+			select {
+			case incoming <- body:
+			case <-connCtx.Done():
 				return
 			}
 		}
 	}()
 
+	for {
+		var body []byte
+		select {
+		case <-connCtx.Done():
+			return
+		case message, ok := <-incoming:
+			if !ok {
+				return
+			}
+			body = message
+		}
+		payload, skip, err := wsRequestPayload(body)
+		if skip {
+			continue
+		}
+		if err != nil {
+			if writeErr := writeWSError(conn, "invalid_request_error", err.Error()); writeErr != nil {
+				return
+			}
+			continue
+		}
+		if !application.serveWSTurn(connCtx, conn, request, payload) {
+			return
+		}
+	}
+}
+
+// wsRequestPayload 解包一条客户端消息为 /v1/responses 请求体。
+// 非 response.create 的控制消息（无 response 包装、无 model）返回 skip。
+func wsRequestPayload(body []byte) ([]byte, bool, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, false, fmt.Errorf("invalid JSON message: %w", err)
+	}
+	// OpenAI 包装格式 {"type":"response.create","response":{...}}：
+	// 真正的请求字段在 response 子对象里；不解包会因缺 model 解码失败。
+	if inner, ok := payload["response"].(map[string]any); ok && payload["type"] != nil {
+		payload = inner
+	} else if kind, _ := payload["type"].(string); kind != "" && kind != "response.create" {
+		if _, hasModel := payload["model"]; !hasModel {
+			return nil, true, nil
+		}
+	}
+	delete(payload, "type")
+	// WebSocket 模式不写 stream 字段，等价于 stream=true。
+	payload["stream"] = true
+	encoded, err := json.Marshal(payload)
+	return encoded, false, err
+}
+
+// serveWSTurn 处理一轮请求；返回 false 表示连接已不可用。
+func (application *App) serveWSTurn(connCtx context.Context, conn *websocket.Conn, outer *http.Request, body []byte) bool {
+	ctx, cancel := context.WithCancel(connCtx)
+	defer cancel()
 	innerRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, "/v1/responses", bytes.NewReader(body))
 	if err != nil {
-		log.Printf("websocket create inner request failed: %v", err)
-		return
+		return writeWSError(conn, "server_error", err.Error()) == nil
+	}
+	for key, values := range outer.Header {
+		switch http.CanonicalHeaderKey(key) {
+		case "Upgrade", "Connection", "Sec-Websocket-Key", "Sec-Websocket-Version", "Sec-Websocket-Extensions", "Sec-Websocket-Protocol":
+			continue
+		}
+		innerRequest.Header[key] = values
 	}
 	innerRequest.Header.Set("Content-Type", "application/json")
-	innerRequest.RemoteAddr = request.RemoteAddr
+	innerRequest.RemoteAddr = outer.RemoteAddr
 
+	_ = conn.SetWriteDeadline(time.Now().Add(wsIdleTimeout))
 	wsWriter := newWSResponseWriter(conn)
 	application.createResponses(wsWriter, innerRequest)
-	// 冲刷非 SSE 残余（错误 JSON 没有 "\n\n" 分隔，不冲就到不了客户端）。
+	// 冲刷非 SSE 残余：错误 JSON 没有空行分隔，不冲就到不了客户端。
 	wsWriter.flushRemainder()
+	return wsWriter.err == nil && connCtx.Err() == nil
+}
 
-	// 如果 createResponses 没有发送 completed/error，尝试补一个干净的关闭。
-	if wsWriter.err == nil {
-		_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-	}
+// writeWSError 以 OpenAI WebSocket 契约的 {"type":"error"} 帧报告错误。
+func writeWSError(conn *websocket.Conn, kind, message string) error {
+	frame, _ := json.Marshal(map[string]any{"type": "error", "error": map[string]any{"type": kind, "message": message}})
+	return conn.WriteMessage(websocket.TextMessage, frame)
 }
 
 // createResponsesWebSocket 是 /v1/responses 的 WebSocket upgrade 入口。

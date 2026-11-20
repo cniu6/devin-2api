@@ -38,6 +38,12 @@ type entry struct {
 	key      string
 	caller   string
 	messages []llm.Message
+	// response 是客户端收到的完整 Response 对象，供 GET /v1/responses/{id} 回放。
+	response []byte
+	// raw 是单个 output item 的 JSON（仅 item 索引条目使用），供 item_reference 解析。
+	raw []byte
+	// itemKeys 是该响应派生的 item 索引键，删除响应时一并清理。
+	itemKeys []string
 	expires  time.Time
 }
 

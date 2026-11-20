@@ -6,6 +6,7 @@ package devin
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -51,7 +52,16 @@ type Config struct {
 	Routes []httpproxy.Route
 	// ForceHTTP1 为 true 时强制 HTTP/1.1，每请求独立连接，避免 HTTP/2 单连接多 stream 并发瓶颈。
 	ForceHTTP1 bool
+	// MaxNewlines 是单次输出的换行上限；<=0 取 DefaultMaxNewlines。
+	MaxNewlines int
 }
+
+// DefaultMaxNewlines 是未配置时的输出换行上限。
+const DefaultMaxNewlines = 400
+
+// DefaultModelAlias 是请求里代表「上游默认模型」的保留模型名，
+// 解析为 GetCascadeModelConfigs.default_override_model_config，取不到则用 devin.model。
+const DefaultModelAlias = "default"
 
 // modelMeta 是模型目录中用于分流匹配的附加标识。
 type modelMeta struct {
@@ -72,6 +82,7 @@ type Adapter struct {
 	modelsMu       sync.RWMutex
 	models         []adapter.ModelInfo
 	modelMeta      map[string]modelMeta
+	defaultModel   string
 	modelsExpiry   time.Time
 	modelsCacheTTL time.Duration
 }
@@ -127,10 +138,7 @@ func (adapter *Adapter) Stream(ctx context.Context, request llm.RequestMessages)
 	if err := request.Validate(); err != nil {
 		return nil, fmt.Errorf("validate Devin request: %w", err)
 	}
-	model := strings.TrimSpace(request.Model)
-	if model == "" {
-		model = adapter.config.Model
-	}
+	model := adapter.resolveModel(ctx, request.Model)
 	if err := adapter.validateImagesForModel(request, model); err != nil {
 		return nil, err
 	}
@@ -149,6 +157,25 @@ func (adapter *Adapter) Stream(ctx context.Context, request llm.RequestMessages)
 		return nil, connectError(err)
 	}
 	return &responseStream{upstream: stream, decoder: newResponseDecoder(model), recorder: recorder}, nil
+}
+
+// resolveModel 把空模型与保留别名 default 解析为实际 uid：
+// 优先上游目录下发的默认覆盖模型，其次配置的 devin.model。
+func (adapter *Adapter) resolveModel(ctx context.Context, requested string) string {
+	model := strings.TrimSpace(requested)
+	if model != "" && !strings.EqualFold(model, DefaultModelAlias) {
+		return model
+	}
+	if model != "" {
+		adapter.ensureMeta(ctx)
+		adapter.modelsMu.RLock()
+		override := adapter.defaultModel
+		adapter.modelsMu.RUnlock()
+		if override != "" {
+			return override
+		}
+	}
+	return adapter.config.Model
 }
 
 // validateImagesForModel 在本地尽早拒绝「无视觉能力模型 + 图片」组合，错误信息对客户端可读。
@@ -301,6 +328,14 @@ func (a *Adapter) catalog(ctx context.Context) ([]adapter.ModelInfo, map[string]
 		return nil, nil, fmt.Errorf("Devin GetCascadeModelConfigs: %w", err)
 	}
 
+	// 上游下发的默认覆盖模型（IDE 未选模型时的默认项），供保留别名 default 使用。
+	defaultOverride := ""
+	if override := resp.Msg.GetDefaultOverrideModelConfig(); override != nil {
+		defaultOverride = override.GetModelUid()
+		if defaultOverride == "" && override.GetModelOrAliasDeprecated() != nil {
+			defaultOverride = override.GetModelOrAliasDeprecated().GetModelUid()
+		}
+	}
 	// 分组索引：picker 分组按 model label 归组，先建 label→组名 映射。
 	labelGroups := map[string][]string{}
 	for _, s := range resp.Msg.GetClientModelSorts() {
@@ -399,6 +434,7 @@ func (a *Adapter) catalog(ctx context.Context) ([]adapter.ModelInfo, map[string]
 	}
 	a.models = models
 	a.modelMeta = meta
+	a.defaultModel = defaultOverride
 	a.modelsExpiry = time.Now().Add(a.modelsCacheTTL)
 	return models, meta, nil
 }
@@ -460,7 +496,7 @@ func buildRequest(request llm.RequestMessages, config Config) (*devinproto.GetCh
 	configuration := &devinproto.ExaCodeiumCommonPb_CompletionConfiguration{
 		NumCompletions: proto.Uint64(1),
 		MaxTokens:      proto.Uint64(128000),
-		MaxNewlines:    proto.Uint64(400),
+		MaxNewlines:    proto.Uint64(uint64(maxNewlines(config.MaxNewlines))),
 		Temperature:    proto.Float64(1),
 		TopK:           proto.Uint64(40),
 		TopP:           proto.Float64(0.95),
@@ -483,6 +519,15 @@ func buildRequest(request llm.RequestMessages, config Config) (*devinproto.GetCh
 	}
 	if request.Seed != nil {
 		configuration.Seed = proto.Uint64(uint64(*request.Seed))
+	}
+	if tier := strings.TrimSpace(request.ServiceTier); tier != "" && tier != "auto" {
+		configuration.ServiceTier = proto.String(tier)
+	}
+	// 末条是助手消息 = Anthropic 预填充（prefill）：告诉上游从该半截回复续写。
+	if count := len(request.Messages); count > 0 {
+		if _, ok := request.Messages[count-1].(llm.AssistantMessage); ok {
+			configuration.LastMessageIsPartial = proto.Bool(true)
+		}
 	}
 	result := &devinproto.GetChatMessageRequest{
 		Metadata:      metadata,
@@ -523,6 +568,9 @@ func buildRequest(request llm.RequestMessages, config Config) (*devinproto.GetCh
 		}
 		result.Tools = append(result.Tools, converted)
 	}
+	if request.SystemCacheControl {
+		result.SystemPromptCacheOptions = ephemeralCache()
+	}
 	if request.DisableParallelToolCalls {
 		result.DisableParallelToolCalls = proto.Bool(true)
 	}
@@ -530,6 +578,20 @@ func buildRequest(request llm.RequestMessages, config Config) (*devinproto.GetCh
 		result.ToolChoice = choice
 	}
 	return result, nil
+}
+
+func maxNewlines(configured int) int {
+	if configured > 0 {
+		return configured
+	}
+	return DefaultMaxNewlines
+}
+
+// ephemeralCache 构造与 Anthropic cache_control:{type:ephemeral} 对应的上游缓存断点。
+func ephemeralCache() *devinproto.ExaChatPb_PromptCacheOptions {
+	return &devinproto.ExaChatPb_PromptCacheOptions{
+		Type: devinproto.ExaChatPb_CacheControlType_ExaChatPb_CacheControlType_CACHE_CONTROL_TYPE_EPHEMERAL.Enum(),
+	}
 }
 
 // enumShort 从 proto 枚举全名提取短名：
@@ -578,7 +640,11 @@ func convertToolChoice(choice *llm.ToolChoice) *devinproto.ExaChatPb_ChatToolCho
 func convertMessage(message llm.Message, attachImages bool) ([]*devinproto.ExaChatPb_ChatMessagePrompt, error) {
 	switch message := message.(type) {
 	case llm.UserMessage:
-		return []*devinproto.ExaChatPb_ChatMessagePrompt{promptForContent(devinproto.ExaCodeiumCommonPb_ChatMessageSource_ExaCodeiumCommonPb_ChatMessageSource_CHAT_MESSAGE_SOURCE_USER, message.Content, attachImages)}, nil
+		prompt := promptForContent(devinproto.ExaCodeiumCommonPb_ChatMessageSource_ExaCodeiumCommonPb_ChatMessageSource_CHAT_MESSAGE_SOURCE_USER, message.Content, attachImages)
+		if message.CacheControl {
+			prompt.PromptCacheOptions = ephemeralCache()
+		}
+		return []*devinproto.ExaChatPb_ChatMessagePrompt{prompt}, nil
 	case llm.AssistantMessage:
 		// 助手历史不回传图片；若有意外 ImageContent 同样占位。
 		prompt := promptForContent(devinproto.ExaCodeiumCommonPb_ChatMessageSource_ExaCodeiumCommonPb_ChatMessageSource_CHAT_MESSAGE_SOURCE_SYSTEM, message.Content, false)
@@ -589,13 +655,25 @@ func convertMessage(message llm.Message, attachImages bool) ([]*devinproto.ExaCh
 					Name:          proto.String(call.Name),
 					ArgumentsJson: proto.String(string(call.Arguments)),
 				})
+				// Gemini 要求带工具调用的历史轮次回传思考签名，否则多轮工具调用会被拒。
+				if len(prompt.GeminiThoughtSignature) == 0 && call.ThoughtSignature != "" {
+					if signature, err := base64.StdEncoding.DecodeString(call.ThoughtSignature); err == nil {
+						prompt.GeminiThoughtSignature = signature
+					}
+				}
 			}
+		}
+		if message.CacheControl {
+			prompt.PromptCacheOptions = ephemeralCache()
 		}
 		return []*devinproto.ExaChatPb_ChatMessagePrompt{prompt}, nil
 	case llm.ToolResultMessage:
 		prompt := promptForContent(devinproto.ExaCodeiumCommonPb_ChatMessageSource_ExaCodeiumCommonPb_ChatMessageSource_CHAT_MESSAGE_SOURCE_TOOL, message.Content, attachImages)
 		prompt.ToolCallId = proto.String(message.ToolCallID)
 		prompt.ToolResultIsError = proto.Bool(message.IsError)
+		if message.CacheControl {
+			prompt.PromptCacheOptions = ephemeralCache()
+		}
 		return []*devinproto.ExaChatPb_ChatMessagePrompt{prompt}, nil
 	default:
 		return nil, fmt.Errorf("unsupported message type %T", message)

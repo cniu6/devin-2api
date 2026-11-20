@@ -141,14 +141,18 @@ func appendSystem(context *llm.RequestMessages, raw json.RawMessage) error {
 	}
 	for _, part := range parts {
 		var block struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
+			Type         string          `json:"type"`
+			Text         string          `json:"text"`
+			CacheControl json.RawMessage `json:"cache_control"`
 		}
 		if err := json.Unmarshal(part, &block); err != nil {
 			return err
 		}
 		if block.Type != "text" {
 			continue
+		}
+		if hasCacheControl(block.CacheControl) {
+			context.SystemCacheControl = true
 		}
 		if context.SystemPrompt != "" && block.Text != "" {
 			context.SystemPrompt += "\n"
@@ -176,13 +180,14 @@ func appendMessage(context *llm.RequestMessages, message Message) error {
 		}
 		context.Messages = append(context.Messages, messages...)
 	case "assistant":
-		content, err := decodeAssistantContent(message.Content)
+		content, cached, err := decodeAssistantContent(message.Content)
 		if err != nil {
 			return err
 		}
 		context.Messages = append(context.Messages, llm.AssistantMessage{
-			Content:     content,
-			TimestampMS: time.Now().UnixMilli(),
+			Content:      content,
+			TimestampMS:  time.Now().UnixMilli(),
+			CacheControl: cached,
 		})
 	default:
 		// 忽略未知角色。
@@ -213,43 +218,51 @@ func decodeAnthropicUserMessages(messages []llm.Message, raw json.RawMessage) ([
 
 	var result []llm.Message
 	var currentUserContent []llm.Content
+	currentUserCached := false
 	flushUser := func() {
 		if len(currentUserContent) == 0 {
 			return
 		}
 		result = append(result, llm.UserMessage{
-			Content:     currentUserContent,
-			TimestampMS: time.Now().UnixMilli(),
+			Content:      currentUserContent,
+			TimestampMS:  time.Now().UnixMilli(),
+			CacheControl: currentUserCached,
 		})
 		currentUserContent = nil
+		currentUserCached = false
 	}
 
 	for index, part := range parts {
 		var header struct {
-			Type      string          `json:"type"`
-			Text      string          `json:"text"`
-			ToolUseID string          `json:"tool_use_id"`
-			Content   json.RawMessage `json:"content"`
-			IsError   bool            `json:"is_error"`
+			Type         string          `json:"type"`
+			Text         string          `json:"text"`
+			ToolUseID    string          `json:"tool_use_id"`
+			Content      json.RawMessage `json:"content"`
+			IsError      bool            `json:"is_error"`
+			CacheControl json.RawMessage `json:"cache_control"`
 		}
 		if err := json.Unmarshal(part, &header); err != nil {
 			return nil, fmt.Errorf("content[%d]: %w", index, err)
 		}
+		cached := hasCacheControl(header.CacheControl)
 		switch header.Type {
 		case "text":
 			currentUserContent = append(currentUserContent, llm.TextContent{Text: header.Text})
+			currentUserCached = currentUserCached || cached
 		case "image":
 			image, err := common.DecodeImagePart(part)
 			if err != nil {
 				return nil, fmt.Errorf("content[%d]: %w", index, err)
 			}
 			currentUserContent = append(currentUserContent, image)
+			currentUserCached = currentUserCached || cached
 		case "tool_result":
 			flushUser()
 			tool, err := decodeToolResult(messages, header.ToolUseID, header.Content, header.IsError)
 			if err != nil {
 				return nil, fmt.Errorf("content[%d]: %w", index, err)
 			}
+			tool.CacheControl = cached
 			result = append(result, tool)
 			messages = append(messages, tool)
 		default:
@@ -260,36 +273,52 @@ func decodeAnthropicUserMessages(messages []llm.Message, raw json.RawMessage) ([
 	return result, nil
 }
 
-func decodeAssistantContent(raw json.RawMessage) ([]llm.Content, error) {
+// decodeAssistantContent 解码助手历史内容块，并报告是否携带 cache_control 断点。
+func decodeAssistantContent(raw json.RawMessage) ([]llm.Content, bool, error) {
 	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		return []llm.Content{llm.TextContent{Text: ""}}, nil
+		return []llm.Content{llm.TextContent{Text: ""}}, false, nil
 	}
 	var text string
 	if json.Unmarshal(raw, &text) == nil {
-		return []llm.Content{llm.TextContent{Text: text}}, nil
+		return []llm.Content{llm.TextContent{Text: text}}, false, nil
 	}
 	var parts []json.RawMessage
 	if err := json.Unmarshal(raw, &parts); err != nil {
-		return nil, fmt.Errorf("decode assistant content: %w", err)
+		return nil, false, fmt.Errorf("decode assistant content: %w", err)
 	}
 	content := make([]llm.Content, 0, len(parts))
+	cached := false
 	for index, part := range parts {
 		var header struct {
-			Type  string          `json:"type"`
-			Text  string          `json:"text"`
-			ID    string          `json:"id"`
-			Name  string          `json:"name"`
-			Input json.RawMessage `json:"input"`
+			Type         string          `json:"type"`
+			Text         string          `json:"text"`
+			Thinking     string          `json:"thinking"`
+			Signature    string          `json:"signature"`
+			Data         string          `json:"data"`
+			ID           string          `json:"id"`
+			Name         string          `json:"name"`
+			Input        json.RawMessage `json:"input"`
+			CacheControl json.RawMessage `json:"cache_control"`
 		}
 		if err := json.Unmarshal(part, &header); err != nil {
-			return nil, fmt.Errorf("content[%d]: %w", index, err)
+			return nil, false, fmt.Errorf("content[%d]: %w", index, err)
 		}
+		cached = cached || hasCacheControl(header.CacheControl)
 		switch header.Type {
 		case "text":
 			content = append(content, llm.TextContent{Text: header.Text})
 		case "thinking":
-			// 历史中的 thinking 块不需要签名。
-			content = append(content, llm.ThinkingContent{Thinking: header.Text})
+			// Anthropic 思考块正文在 thinking 字段、签名在 signature；
+			// 签名必须原样回传，否则开启 extended thinking 的多轮工具调用会被上游拒绝。
+			thinking := header.Thinking
+			if thinking == "" {
+				thinking = header.Text
+			}
+			content = append(content, llm.ThinkingContent{Thinking: thinking, ThinkingSignature: header.Signature})
+		case "redacted_thinking":
+			if header.Data != "" {
+				content = append(content, llm.ThinkingContent{ThinkingSignature: header.Data, Redacted: true})
+			}
 		case "tool_use":
 			args := header.Input
 			if len(args) == 0 {
@@ -300,7 +329,13 @@ func decodeAssistantContent(raw json.RawMessage) ([]llm.Content, error) {
 			continue
 		}
 	}
-	return content, nil
+	return content, cached, nil
+}
+
+// hasCacheControl 判断内容块是否携带非空 cache_control。
+func hasCacheControl(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null"))
 }
 
 func decodeToolResult(messages []llm.Message, toolUseID string, raw json.RawMessage, isError bool) (llm.ToolResultMessage, error) {

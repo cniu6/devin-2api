@@ -150,7 +150,9 @@ curl http://localhost:8080/healthz
 | `/v1/models` | GET | OpenAI-compatible model list |
 | `/v1/models/{model}` | GET | Single model info |
 | `/v1/responses` | POST | OpenAI Responses API (JSON / typed SSE) |
-| `/v1/responses` | GET | WebSocket upgrade (subprotocol `responses_websockets=2026-02-06`) |
+| `/v1/responses` | GET | WebSocket upgrade (subprotocol `responses_websockets=2026-02-06`); one connection serves multiple `response.create` turns |
+| `/v1/responses/{id}` | GET | Retrieve a stored response (`store` not `false`, within the 30 min TTL) |
+| `/v1/responses/{id}` | DELETE | Delete a stored response and its output items |
 | `/v1/chat/completions` | POST | OpenAI Chat Completions API (JSON / SSE) |
 | `/v1/messages` | POST | Anthropic Messages API (JSON / SSE) |
 | `/v1/audio/transcriptions` | POST | OpenAI-compatible speech-to-text: multipart `file` field (wav/mp3/m4a, ≤25MiB) → `{"text": ...}` |
@@ -281,6 +283,7 @@ All settings live in `config.yaml`, loaded once at startup; unknown fields are r
 | `devin.proxy_pools` | Arbitrarily named proxy pools: `name: [urls...]`; addresses inside a pool rotate per request to spread concurrency; reserved names: `direct`/`default` | No |
 | `devin.routes` | Routing rules: `- models: [patterns...] pool: name`; first match wins; matched against model uid/label/family/upstream group (`*`/`?`, case-insensitive); unmatched models use `devin.proxy` | No |
 | `devin.force_http1` | Force HTTP/1.1 to avoid HTTP/2 multi-stream serialization | No; defaults to `true` |
+| `devin.max_newlines` | Upstream `max_newlines` completion setting | No; defaults to `400` |
 | `debug.enabled` | Write per-request debug logs under `logs/` | No |
 | `dashboard.enabled` | Enable the `/panel` dashboard | No; defaults to `false` (off) |
 | `dashboard.password` | Panel password: empty = random (printed in startup log), `none` = open access, other = fixed | No |
@@ -364,6 +367,12 @@ Or the inverse: leave `proxy` empty (catalog shows only region-visible models) a
 - Sensitive fields such as tokens are redacted as `<redacted>` in debug logs;
 - Images must be base64 data URLs; external URLs, `file_id`, and local file paths are not supported;
 - Each request may carry the full message history (fully supported and recommended); when a request carries only the new turn plus a `previous_response_id` issued by this server, the conversation history is now restored server-side and prepended automatically. An unknown or expired id never fails the request -- it degrades to the single-turn behaviour and is recorded in the debug log;
+- Responses chaining follows OpenAI semantics: a turn that only carries `function_call_output` items (Codex tool loops) gets the stored history injected and tool names resolved; `item_reference` inputs expand to stored output items; `reasoning` input items replay their `encrypted_content` as the thinking signature;
+- Prompt caching: Anthropic/OpenRouter-style `cache_control` on system, user, assistant and tool-result blocks is forwarded as an upstream ephemeral cache breakpoint (verified: second call reports `cache_read_input_tokens`);
+- Model `default` resolves to the upstream default-override model, falling back to `devin.model`;
+- `response_format` (Chat) and `text.format` (Responses) are enforced through a system instruction, since the upstream has no structured-output field; `service_tier` is forwarded;
+- Stop reasons: upstream content filters / provider refusals map to `content_filter` (Chat), `refusal` (Anthropic) and `failed` (Responses);
+- Dashboard login locks a source IP for 15 minutes after 5 failed attempts;
 - `config.yaml` is in `.gitignore`; even though the example is tracked, never commit a real token;
 - Request body size is capped at 32 MiB to accommodate multi-image base64 payloads.
 

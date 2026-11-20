@@ -48,6 +48,8 @@ type AssistantMessage struct {
 	ErrorMessage string
 	// TimestampMS 是创建消息时的 Unix 毫秒时间戳。
 	TimestampMS int64
+	// CacheControl 表示调用方把本条历史消息标记为提示缓存断点。
+	CacheControl bool
 }
 
 // ResponseMessage 是最终助手响应在兼容服务中的语义别名。

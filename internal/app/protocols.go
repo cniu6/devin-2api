@@ -116,6 +116,14 @@ func (a *responsesStreamAdapter) ResponseID() string {
 	return a.encoder.ResponseID()
 }
 
+// FinalResponse 暴露流结束时的完整 Response 对象，供 GET /v1/responses/{id} 回放。
+func (a *responsesStreamAdapter) FinalResponse() []byte {
+	if a == nil || a.encoder == nil {
+		return nil
+	}
+	return a.encoder.FinalResponse()
+}
+
 func (a *responsesStreamAdapter) Encode(event llm.ResponseEvent) ([]eventWire, error) {
 	raw, err := a.encoder.Encode(event)
 	if err != nil {
@@ -160,7 +168,18 @@ func (a *anthropicStreamAdapter) Encode(event llm.ResponseEvent) ([]eventWire, e
 type decodeRequestFunc func([]byte) (llm.RequestMessages, protocolOptions, error)
 
 func decodeResponsesRequest(data []byte) (llm.RequestMessages, protocolOptions, error) {
-	adapted, err := responses.DecodeRequest(data)
+	return decodeResponsesRequestWith(nil)(data)
+}
+
+// decodeResponsesRequestWith 返回能借助 resolver 展开 item_reference 的解码函数。
+func decodeResponsesRequestWith(resolve responses.ItemResolver) decodeRequestFunc {
+	return func(data []byte) (llm.RequestMessages, protocolOptions, error) {
+		return decodeResponsesRequestResolved(data, resolve)
+	}
+}
+
+func decodeResponsesRequestResolved(data []byte, resolve responses.ItemResolver) (llm.RequestMessages, protocolOptions, error) {
+	adapted, err := responses.DecodeRequestWithResolver(data, resolve)
 	if err != nil {
 		return llm.RequestMessages{}, protocolOptions{}, err
 	}

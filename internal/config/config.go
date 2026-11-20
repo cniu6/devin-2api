@@ -58,6 +58,9 @@ type DevinConfig struct {
 	// 避免 HTTP/2 单连接多 stream 复用导致的上游并发瓶颈（首字延迟飙升/卡住）。
 	// 行为对齐 Devin 客户端多窗口各自独立连接的模式。默认 true。
 	ForceHTTP1 *bool `yaml:"force_http1"`
+	// MaxNewlines 是上游单次输出允许的最大换行数（超过即以 length 截断）；
+	// 0/留空取默认值。长代码生成场景可调大。
+	MaxNewlines int `yaml:"max_newlines"`
 }
 
 // DebugConfig 保存请求级调试日志配置。

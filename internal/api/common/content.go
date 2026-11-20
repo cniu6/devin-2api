@@ -283,3 +283,64 @@ func ContentText(content []llm.Content) string {
 	}
 	return builder.String()
 }
+
+// HasCacheControl 判断消息 content 的任一内容块是否携带非空 cache_control
+// （Anthropic 原生与 OpenRouter 风格的 OpenAI 兼容请求都使用该写法）。
+func HasCacheControl(raw json.RawMessage) bool {
+	var parts []struct {
+		CacheControl json.RawMessage `json:"cache_control"`
+	}
+	if json.Unmarshal(raw, &parts) != nil {
+		return false
+	}
+	for _, part := range parts {
+		trimmed := bytes.TrimSpace(part.CacheControl)
+		if len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null")) {
+			return true
+		}
+	}
+	return false
+}
+
+// ResponseFormatInstruction 把 OpenAI response_format / text.format 转为系统提示约束。
+// Devin 上游没有结构化输出字段，只能以指令形式下发；text/空值返回空串。
+func ResponseFormatInstruction(raw json.RawMessage) string {
+	var format struct {
+		Type       string          `json:"type"`
+		Name       string          `json:"name"`
+		Schema     json.RawMessage `json:"schema"`
+		JSONSchema *struct {
+			Name   string          `json:"name"`
+			Schema json.RawMessage `json:"schema"`
+		} `json:"json_schema"`
+	}
+	if len(bytes.TrimSpace(raw)) == 0 || json.Unmarshal(raw, &format) != nil {
+		return ""
+	}
+	switch format.Type {
+	case "json_object":
+		return "Respond with a single valid JSON object only. Do not wrap it in markdown code fences or add any other text."
+	case "json_schema":
+		schema := format.Schema
+		if format.JSONSchema != nil && len(format.JSONSchema.Schema) > 0 {
+			schema = format.JSONSchema.Schema
+		}
+		if len(bytes.TrimSpace(schema)) == 0 {
+			return "Respond with a single valid JSON object only. Do not wrap it in markdown code fences or add any other text."
+		}
+		return "Respond with a single valid JSON value that strictly conforms to this JSON Schema. Do not wrap it in markdown code fences or add any other text.\nJSON Schema:\n" + string(schema)
+	default:
+		return ""
+	}
+}
+
+// AppendSystemInstruction 把附加约束追加到系统提示词末尾。
+func AppendSystemInstruction(system, instruction string) string {
+	if instruction == "" {
+		return system
+	}
+	if system == "" {
+		return instruction
+	}
+	return system + "\n\n" + instruction
+}

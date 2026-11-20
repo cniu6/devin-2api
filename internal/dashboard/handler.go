@@ -6,12 +6,15 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -44,6 +47,8 @@ type Handler struct {
 	baseTransport http.RoundTripper
 	sessionMu     sync.RWMutex
 	sessionTokens map[string]time.Time
+	// loginFailures 按来源 IP 记录登录失败，防止在线爆破面板密码。
+	loginFailures map[string]*loginFailure
 
 	// 面板数据缓存：模型目录、供应商列表、模型状态均不经常变化，缓存可显著降低上游压力。
 	cacheMu             sync.RWMutex
@@ -56,6 +61,73 @@ type Handler struct {
 	modelStatusesExpiry time.Time
 	// stats 是可选的请求统计采集器。
 	stats *stats.Collector
+}
+
+// loginFailure 是单个来源的失败计数窗口。
+type loginFailure struct {
+	count       int
+	windowStart time.Time
+	lockedUntil time.Time
+}
+
+const (
+	loginMaxFailures = 5
+	loginWindow      = 15 * time.Minute
+	loginLockout     = 15 * time.Minute
+)
+
+// loginSource 取 TCP 对端地址作为限流键：X-Forwarded-For 可被伪造来绕过限流，不采信。
+func loginSource(r *http.Request) string {
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
+// loginLocked 报告来源是否处于锁定期，并返回剩余时长。
+func (h *Handler) loginLocked(source string, now time.Time) (time.Duration, bool) {
+	h.sessionMu.Lock()
+	defer h.sessionMu.Unlock()
+	failure := h.loginFailures[source]
+	if failure == nil || !now.Before(failure.lockedUntil) {
+		return 0, false
+	}
+	return failure.lockedUntil.Sub(now), true
+}
+
+// recordLoginResult 更新失败计数：成功清零，窗口内失败达到上限即锁定。
+func (h *Handler) recordLoginResult(source string, ok bool, now time.Time) {
+	h.sessionMu.Lock()
+	defer h.sessionMu.Unlock()
+	if h.loginFailures == nil {
+		h.loginFailures = map[string]*loginFailure{}
+	}
+	if ok {
+		delete(h.loginFailures, source)
+		return
+	}
+	failure := h.loginFailures[source]
+	if failure == nil || now.Sub(failure.windowStart) > loginWindow {
+		failure = &loginFailure{windowStart: now}
+		h.loginFailures[source] = failure
+	}
+	failure.count++
+	if failure.count >= loginMaxFailures {
+		failure.lockedUntil = now.Add(loginLockout)
+		failure.count = 0
+		failure.windowStart = now
+	}
+	// 顺手清理过期记录与会话，防止长期运行时表无限增长。
+	for key, entry := range h.loginFailures {
+		if now.Sub(entry.windowStart) > loginWindow && !now.Before(entry.lockedUntil) {
+			delete(h.loginFailures, key)
+		}
+	}
+	for token, expiry := range h.sessionTokens {
+		if now.After(expiry) {
+			delete(h.sessionTokens, token)
+		}
+	}
 }
 
 // modelCatalog 是上游返回的模型目录：模型配置 + 客户端模型分组（分类）。
@@ -131,12 +203,24 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"ok":true,"open":true}`))
 		return
 	}
-	password := r.FormValue("password")
-	if subtle.ConstantTimeCompare([]byte(password), []byte(h.password)) != 1 {
+	source, now := loginSource(r), time.Now()
+	if remaining, locked := h.loginLocked(source, now); locked {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", strconv.Itoa(int(remaining.Seconds())+1))
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = fmt.Fprintf(w, `{"error":"失败次数过多，请 %d 分钟后再试"}`, int(remaining.Minutes())+1)
+		return
+	}
+	// 先哈希再比较：ConstantTimeCompare 对长度不等会立即返回，泄露密码长度。
+	provided, expected := sha256.Sum256([]byte(r.FormValue("password"))), sha256.Sum256([]byte(h.password))
+	if subtle.ConstantTimeCompare(provided[:], expected[:]) != 1 {
+		h.recordLoginResult(source, false, now)
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
 		_, _ = w.Write([]byte(`{"error":"密码错误"}`))
 		return
 	}
+	h.recordLoginResult(source, true, now)
 	sessionID := generateSessionID()
 	h.sessionMu.Lock()
 	h.sessionTokens[sessionID] = time.Now().Add(24 * time.Hour)
@@ -147,6 +231,8 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 		HttpOnly: true,
 		MaxAge:   86400,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   r.TLS != nil,
 	})
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write([]byte(`{"ok":true}`))

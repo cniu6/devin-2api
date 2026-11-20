@@ -44,6 +44,8 @@ type StreamEncoder struct {
 	store bool
 	// echo 保存需要原样回显的请求侧字段。
 	echo *ResponseEcho
+	// final 是终止事件里的完整 Response 对象 JSON，供服务端保存与回放。
+	final []byte
 }
 
 // streamItem 保存一个 reasoning、function_call 或 message output item 的编码状态。
@@ -88,6 +90,14 @@ func (encoder *StreamEncoder) ResponseID() string {
 		return ""
 	}
 	return encoder.responseID
+}
+
+// FinalResponse 返回流结束时发给客户端的完整 Response 对象；未完成时为 nil。
+func (encoder *StreamEncoder) FinalResponse() []byte {
+	if encoder == nil {
+		return nil
+	}
+	return encoder.final
 }
 
 // SetStore 记录本次响应是否真的会被服务端保留，使响应体的 store 字段如实回显。
@@ -376,6 +386,7 @@ func (encoder *StreamEncoder) done(event llm.ResponseEvent) ([]SSEEvent, error) 
 	} else {
 		response["completed_at"] = time.Now().Unix()
 	}
+	encoder.final, _ = json.Marshal(response)
 	return []SSEEvent{encoder.emit(eventName, map[string]any{"response": response})}, nil
 }
 

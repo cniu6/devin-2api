@@ -150,7 +150,9 @@ curl http://localhost:8080/healthz
 | `/v1/models` | GET | OpenAI 兼容模型列表 |
 | `/v1/models/{model}` | GET | 单个模型信息 |
 | `/v1/responses` | POST | OpenAI Responses API（JSON / typed SSE） |
-| `/v1/responses` | GET | 升级 WebSocket（子协议 `responses_websockets=2026-02-06`） |
+| `/v1/responses` | GET | 升级 WebSocket（子协议 `responses_websockets=2026-02-06`）；单连接支持多轮 `response.create` |
+| `/v1/responses/{id}` | GET | 取回已保存的响应（`store` 非 `false`，30 分钟内有效） |
+| `/v1/responses/{id}` | DELETE | 删除已保存的响应及其 output item |
 | `/v1/chat/completions` | POST | OpenAI Chat Completions API（JSON / SSE） |
 | `/v1/messages` | POST | Anthropic Messages API（JSON / SSE） |
 | `/v1/audio/transcriptions` | POST | OpenAI 兼容语音转写：multipart `file` 字段（wav/mp3/m4a，≤25MiB）→ `{"text": ...}` |
@@ -281,6 +283,7 @@ curl http://localhost:8080/v1/models
 | `devin.proxy_pools` | 任意命名的代理池集合：`名字: [代理地址...]`；池内多地址按请求轮询分摊并发；保留名 `direct`/`default` | 否 |
 | `devin.routes` | 分流规则列表：`- models: [通配符...] pool: 池名`；自上而下首个命中的规则生效，按模型 uid/标签/系列/分组匹配（`*`/`?`，忽略大小写）；未命中走 `devin.proxy` | 否 |
 | `devin.force_http1` | 强制 HTTP/1.1，避免 HTTP/2 单连接多 stream 并发瓶颈 | 否；默认 `true` |
+| `devin.max_newlines` | 上游 `max_newlines` 输出配置 | 否；默认 `400` |
 | `debug.enabled` | 在配置文件同目录 `logs/` 下写请求级调试日志 | 否 |
 | `dashboard.enabled` | 是否启用 `/panel` 管理面板 | 否；默认 `false`（关闭） |
 | `dashboard.password` | 面板密码：留空=随机密码（打印启动日志）、`none`=免密、其他=固定密码 | 否 |
@@ -363,7 +366,13 @@ devin:
 - 鉴权头同时支持 `Authorization: Bearer <key>` 和 `X-Api-Key: <key>`；
 - token 等敏感字段在调试日志中会被脱敏为 `<redacted>`；
 - 图片只支持 base64 data URL，不支持外部 URL、`file_id` 或本地文件路径；
-- 每轮请求仍需携带完整消息历史；`previous_response_id` 字段会被接收，但当前不会启用服务端状态保存；
+- 可以每轮带完整历史；也可以只发本轮 + `previous_response_id`，服务端自动补齐历史（未知/过期 id 不报错，降级为单轮并记入调试日志）；
+- Responses 链式语义与 OpenAI 一致：只带 `function_call_output` 的一轮（Codex 工具循环）会自动注入历史并回填工具名；`item_reference` 展开为已保存的 output item；`reasoning` 输入项的 `encrypted_content` 作为思考签名回放；
+- 提示缓存：system / user / assistant / tool_result 上的 `cache_control`（Anthropic 与 OpenRouter 写法）透传为上游 ephemeral 缓存断点（实测第二次请求命中 `cache_read_input_tokens`）；
+- 模型名 `default` 解析为上游默认覆盖模型，取不到则用 `devin.model`；
+- `response_format`（Chat）与 `text.format`（Responses）通过系统指令约束（上游无结构化输出字段）；`service_tier` 透传；
+- 停止原因：上游内容过滤 / 供应商拒答映射为 `content_filter`（Chat）、`refusal`（Anthropic）、`failed`（Responses）；
+- 面板登录同一来源 IP 连续失败 5 次锁定 15 分钟；
 - `config.yaml` 已加入 `.gitignore`；即使示例文件被 git 追踪，真实 token 也不要提交；
 - 请求体上限为 32 MiB，满足多图 base64 场景。
 

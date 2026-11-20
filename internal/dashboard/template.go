@@ -36,7 +36,7 @@ body{font-family:"Segoe UI",system-ui,-apple-system,"Microsoft YaHei",sans-serif
 document.getElementById('f').addEventListener('submit',async e=>{
 e.preventDefault();
 const res=await fetch('/panel/login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'password='+encodeURIComponent(document.getElementById('p').value)});
-if(res.ok){location.reload()}else{const el=document.getElementById('err');el.style.display='block';setTimeout(()=>el.style.display='none',2000)}
+if(res.ok){location.reload()}else{const el=document.getElementById('err');let msg='密码错误';try{const j=await res.json();if(j&&j.error)msg=j.error}catch(_){}el.textContent=msg;el.style.display='block';setTimeout(()=>el.style.display='none',res.status===429?5000:2000)}
 });
 </script>
 </body>

@@ -49,6 +49,8 @@ devin:
   # 被上游串行处理导致并发卡住/首字延迟飙升。默认 true。
   # 如上游不支持 HTTP/1.1 流式可设 false 回到 HTTP/2。
   force_http1: true
+  # 上游 max_newlines 输出配置；0/留空 = 400。
+  # max_newlines: 400
 
 dashboard:
   # 是否启用 /panel 管理面板；默认 false（关闭），需显式开启。

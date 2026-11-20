@@ -49,6 +49,8 @@ type responseDecoder struct {
 	stopReason llm.StopReason
 	// providerRefusal 表示上游供应商在 usage 中标记了拒答。
 	providerRefusal bool
+	// geminiSignature 是本轮 Gemini 思考签名（base64），完成时挂到工具调用上。
+	geminiSignature string
 }
 
 // toolState 保存一次 Devin 工具调用的累计状态。
@@ -159,11 +161,10 @@ func (decoder *responseDecoder) updateMetadata(response *devinproto.GetChatMessa
 			decoder.providerRefusal = true
 		}
 	}
-	// 上游按帧下发的 Gemini 思考签名属于最后打开的工具调用；重放需要原样回传。
-	if sig := response.GetGeminiThoughtSignature(); len(sig) > 0 && len(decoder.tools) > 0 {
-		state := decoder.tools[len(decoder.tools)-1]
-		state.call.ThoughtSignature = base64.StdEncoding.EncodeToString(sig)
-		decoder.partial.Content[state.contentIdx] = state.call
+	// Gemini 思考签名是消息级字段，可能早于或晚于工具调用帧到达；
+	// 先暂存，complete 时挂到本轮工具调用上，重放时原样回传。
+	if sig := response.GetGeminiThoughtSignature(); len(sig) > 0 {
+		decoder.geminiSignature = base64.StdEncoding.EncodeToString(sig)
 	}
 	if cost := response.GetCommittedCreditCost(); cost != 0 {
 		decoder.partial.Usage.CreditCost = int64(cost)
@@ -322,6 +323,9 @@ func (decoder *responseDecoder) complete(reason llm.StopReason) []llm.ResponseEv
 		}
 		// 在结束时一次性把 Builder 中的完整参数转成 JSON，避免中间反复解析/拷贝。
 		state.call.Arguments = json.RawMessage(state.arguments.String())
+		if state.call.ThoughtSignature == "" {
+			state.call.ThoughtSignature = decoder.geminiSignature
+		}
 		if !isJSONObject(state.call.Arguments) {
 			state.call.Arguments = json.RawMessage(`{}`)
 		}
