@@ -73,6 +73,17 @@ func NewStreamEncoder(model string) *StreamEncoder {
 	}
 }
 
+// ResponseID 返回本次流式响应对客户端公布的 resp_ 标识。
+//
+// 暴露它是为了让服务端能按「客户端真正收到的那个 id」保存会话：流式响应的 id
+// 由本编码器在构造时生成，与 message.ResponseID 无关，事后无法从上游字段反推。
+func (encoder *StreamEncoder) ResponseID() string {
+	if encoder == nil {
+		return ""
+	}
+	return encoder.responseID
+}
+
 // EncodeResponse 将最终助手消息编码为非流式 Responses JSON 响应。
 func EncodeResponse(message *llm.AssistantMessage) ([]byte, error) {
 	if message == nil {
