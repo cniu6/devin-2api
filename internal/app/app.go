@@ -150,23 +150,75 @@ func (application *App) listModels(writer http.ResponseWriter, request *http.Req
 	}
 	data := make([]map[string]any, 0, len(models))
 	for _, m := range models {
-		created := m.Created
-		if created == 0 {
-			created = time.Now().Unix()
-		}
-		ownedBy := m.OwnedBy
-		if ownedBy == "" {
-			ownedBy = "devin"
-		}
-		entry := map[string]any{
-			"id": m.ID, "object": "model", "created": created, "owned_by": ownedBy,
-		}
-		// 非 OpenAI 标准字段，供面板/客户端识别是否可传图。
-		entry["supports_images"] = m.SupportsImages
-		data = append(data, entry)
+		data = append(data, modelEntry(m))
 	}
 	writer.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(writer).Encode(map[string]any{"object": "list", "data": data})
+}
+
+// modelEntry 把目录中的模型信息序列化为 /v1/models 条目：
+// 前三项是 OpenAI 契约字段，其余为上游目录的非标准扩展字段（缺省不输出）。
+func modelEntry(m adapter.ModelInfo) map[string]any {
+	created := m.Created
+	if created == 0 {
+		created = time.Now().Unix()
+	}
+	ownedBy := m.OwnedBy
+	if ownedBy == "" {
+		ownedBy = "devin"
+	}
+	entry := map[string]any{
+		"id": m.ID, "object": "model", "created": created, "owned_by": ownedBy,
+	}
+	entry["supports_images"] = m.SupportsImages
+	if m.Label != "" {
+		entry["label"] = m.Label
+	}
+	if m.Description != "" {
+		entry["description"] = m.Description
+	}
+	if m.Family != "" {
+		entry["family"] = m.Family
+	}
+	if m.Provider != "" {
+		entry["provider"] = m.Provider
+	}
+	if m.APIProvider != "" {
+		entry["api_provider"] = m.APIProvider
+	}
+	if m.CostTier != "" {
+		entry["cost_tier"] = m.CostTier
+	}
+	if m.PricingType != "" {
+		entry["pricing_type"] = m.PricingType
+	}
+	if m.CreditMultiplier != 0 {
+		entry["credit_multiplier"] = m.CreditMultiplier
+	}
+	if m.MaxTokens > 0 {
+		entry["context_window"] = m.MaxTokens
+	}
+	if m.Promo != nil {
+		promo := map[string]any{"active": true, "label": m.Promo.Label}
+		if m.Promo.EndDate > 0 {
+			promo["end_date"] = time.Unix(m.Promo.EndDate, 0).UTC().Format(time.RFC3339)
+		}
+		entry["promo"] = promo
+	}
+	flags := map[string]bool{
+		"is_beta": m.IsBeta, "is_new": m.IsNew, "is_recommended": m.IsRecommended,
+		"is_premium": m.IsPremium, "is_capacity_limited": m.IsCapacityLimited,
+		"is_command": m.IsCommand, "disabled": m.Disabled,
+	}
+	for key, value := range flags {
+		if value {
+			entry[key] = true
+		}
+	}
+	if m.BetaWarning != "" {
+		entry["beta_warning"] = m.BetaWarning
+	}
+	return entry
 }
 
 // getModel 返回 OpenAI 兼容的 GET /v1/models/{model}。
@@ -187,19 +239,8 @@ func (application *App) getModel(writer http.ResponseWriter, request *http.Reque
 	}
 	for _, m := range models {
 		if m.ID == id {
-			created := m.Created
-			if created == 0 {
-				created = time.Now().Unix()
-			}
-			ownedBy := m.OwnedBy
-			if ownedBy == "" {
-				ownedBy = "devin"
-			}
 			writer.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(writer).Encode(map[string]any{
-				"id": m.ID, "object": "model", "created": created, "owned_by": ownedBy,
-				"supports_images": m.SupportsImages,
-			})
+			_ = json.NewEncoder(writer).Encode(modelEntry(m))
 			return
 		}
 	}
@@ -463,7 +504,7 @@ func (application *App) createCompletion(
 	}
 	updateCompletionIdentity(&completion, message)
 	finalMessage = message
-	body, err = encodeFinalWithStore(protocol, message, options.Store)
+	body, err = encodeFinal(protocol, message, options)
 	if err != nil {
 		completion.StatusCode = http.StatusInternalServerError
 		writeLoggedError(writer, recorder, "http_encode", completion.StatusCode, err)
@@ -812,16 +853,16 @@ func (application *App) rememberStreamExchange(
 	application.responses.PutWithID(caller, responseID, history)
 }
 
-// encodeFinalWithStore 编码非流式响应。
-// Responses 协议的 store 字段必须如实反映服务端行为：恒定 true 会让写了
+// encodeFinal 编码非流式响应。
+// Responses 协议的 store 字段和请求侧参数必须如实反映：恒定 true 会让写了
 // store:false 的调用方以为会话被保留，而事实上它并没有。
-func encodeFinalWithStore(
+func encodeFinal(
 	protocol protocolEncoder,
 	message *llm.AssistantMessage,
-	store bool,
+	options protocolOptions,
 ) ([]byte, error) {
 	if responds, ok := protocol.(responsesProtocol); ok {
-		return responds.EncodeFinalWithStore(message, store)
+		return responds.EncodeFinalWithEcho(message, options.Store, options.Echo)
 	}
 	return protocol.EncodeFinal(message)
 }
@@ -833,7 +874,7 @@ func newStreamEncoderWithStore(
 	options protocolOptions,
 ) streamEncoder {
 	if _, ok := protocol.(responsesProtocol); ok {
-		return NewResponsesStreamEncoder(model, options.Store)
+		return NewResponsesStreamEncoder(model, options.Store, options.Echo)
 	}
 	return protocol.NewStreamEncoder(model, options.IncludeUsage)
 }

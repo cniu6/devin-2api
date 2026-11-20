@@ -41,7 +41,11 @@ func TestDecodeRequestStoreExplicitTrue(t *testing.T) {
 // encodeStore 取出编码后响应体里的 store 字段。
 func encodeStore(t *testing.T, message *llm.AssistantMessage, store ...bool) bool {
 	t.Helper()
-	body, err := EncodeResponse(message, store...)
+	storeValue := true
+	if len(store) > 0 {
+		storeValue = store[0]
+	}
+	body, err := EncodeResponse(message, storeValue, nil)
 	if err != nil {
 		t.Fatalf("EncodeResponse: %v", err)
 	}

@@ -2,6 +2,7 @@
 package responses
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -41,6 +42,8 @@ type StreamEncoder struct {
 	completed bool
 	// store 记录本次响应是否会被服务端保留，用于在响应体里如实回显。
 	store bool
+	// echo 保存需要原样回显的请求侧字段。
+	echo *ResponseEcho
 }
 
 // streamItem 保存一个 reasoning、function_call 或 message output item 的编码状态。
@@ -93,9 +96,14 @@ func (encoder *StreamEncoder) SetStore(store bool) {
 	encoder.store = store
 }
 
+// SetEcho 记录需要原样回显的请求侧字段；nil 表示全部使用默认值。
+func (encoder *StreamEncoder) SetEcho(echo *ResponseEcho) {
+	encoder.echo = echo
+}
+
 // EncodeResponse 将最终助手消息编码为非流式 Responses JSON 响应。
-// store 为可选参数：不传时按 true 回显，保持既有调用点语义不变。
-func EncodeResponse(message *llm.AssistantMessage, store ...bool) ([]byte, error) {
+// store 必须回显真实值；echo 携带请求侧需要原样回显的字段（可为 nil）。
+func EncodeResponse(message *llm.AssistantMessage, store bool, echo *ResponseEcho) ([]byte, error) {
 	if message == nil {
 		return nil, fmt.Errorf("response message is nil")
 	}
@@ -116,11 +124,7 @@ func EncodeResponse(message *llm.AssistantMessage, store ...bool) ([]byte, error
 		createdAt = time.Now().Unix()
 	}
 	status := responseStatus(message.StopReason)
-	storeValue := true
-	if len(store) > 0 {
-		storeValue = store[0]
-	}
-	response := baseResponse(responseID, model, createdAt, status, storeValue)
+	response := baseResponse(responseID, model, createdAt, status, store, echo)
 	if status == "completed" {
 		response["completed_at"] = time.Now().Unix()
 	}
@@ -172,7 +176,7 @@ func (encoder *StreamEncoder) start() []SSEEvent {
 		return nil
 	}
 	encoder.started = true
-	created := baseResponse(encoder.responseID, encoder.model, encoder.createdAt, "in_progress", encoder.store)
+	created := baseResponse(encoder.responseID, encoder.model, encoder.createdAt, "in_progress", encoder.store, encoder.echo)
 	return []SSEEvent{
 		encoder.emit("response.created", map[string]any{"response": created}),
 		encoder.emit("response.in_progress", map[string]any{"response": created}),
@@ -357,7 +361,12 @@ func (encoder *StreamEncoder) done(event llm.ResponseEvent) ([]SSEEvent, error) 
 		}
 	}
 	encoder.completed = true
-	response := baseResponse(encoder.responseID, encoder.model, encoder.createdAt, responseStatus(event.Reason), encoder.store)
+	// 上游可能替换实际出答模型；完成事件里如实回显 ResponseModel。
+	model := encoder.model
+	if event.Message != nil && event.Message.ResponseModel != "" {
+		model = event.Message.ResponseModel
+	}
+	response := baseResponse(encoder.responseID, model, encoder.createdAt, responseStatus(event.Reason), encoder.store, encoder.echo)
 	response["output"] = encoder.completedOutput()
 	response["usage"] = responseUsage(event.Message.Usage)
 	eventName := "response.completed"
@@ -379,7 +388,7 @@ func (encoder *StreamEncoder) failed(event llm.ResponseEvent) []SSEEvent {
 	// OpenAI Responses API 中，流式失败应发送 response.failed 事件，
 	// 包含 status="failed" 的 response 对象与 error 字段。
 	errorType := common.OpenAIErrorType(message)
-	response := baseResponse(encoder.responseID, encoder.model, encoder.createdAt, "failed", encoder.store)
+	response := baseResponse(encoder.responseID, encoder.model, encoder.createdAt, "failed", encoder.store, encoder.echo)
 	response["error"] = map[string]any{"message": message, "type": errorType, "code": nil, "param": nil}
 	return []SSEEvent{encoder.emit("response.failed", map[string]any{
 		"response": response,
@@ -436,10 +445,37 @@ func (encoder *StreamEncoder) emit(name string, payload map[string]any) SSEEvent
 	return SSEEvent{Name: name, Data: data}
 }
 
-func baseResponse(id string, model string, createdAt int64, status string, store bool) map[string]any {
-	// 对齐 OpenAI Response 对象的稳定字段。store 必须回显真实值：
-	// 恒定输出 true 会让写了 store:false 的调用方以为会话被保留。
-	return map[string]any{
+// ResponseEcho 保存需要在 Response 对象中原样回显的请求侧字段。
+// OpenAI 契约要求服务端把调用方发来的参数如实返回；全写死会让调用方
+// 无法核对自己的配置是否生效（与已修复的 store 字段同理）。
+type ResponseEcho struct {
+	Instructions       string
+	Temperature        *float64
+	TopP               *float64
+	MaxOutputTokens    *int
+	PreviousResponseID string
+	ToolChoice         json.RawMessage
+	ParallelToolCalls  *bool
+	Truncation         string
+	Metadata           json.RawMessage
+	Reasoning          json.RawMessage
+	Text               json.RawMessage
+	Tools              json.RawMessage
+}
+
+// echoRaw 原样回显请求侧 JSON；空值回退 def。
+func echoRaw(raw json.RawMessage, def any) any {
+	if len(bytes.TrimSpace(raw)) > 0 {
+		var value any
+		if err := json.Unmarshal(raw, &value); err == nil {
+			return value
+		}
+	}
+	return def
+}
+
+func baseResponse(id string, model string, createdAt int64, status string, store bool, echo *ResponseEcho) map[string]any {
+	response := map[string]any{
 		"id": id, "object": "response", "created_at": createdAt, "status": status,
 		"error": nil, "incomplete_details": nil, "instructions": nil, "model": model,
 		"output": []any{}, "parallel_tool_calls": true, "previous_response_id": nil,
@@ -448,6 +484,36 @@ func baseResponse(id string, model string, createdAt int64, status string, store
 		"tool_choice": "auto", "tools": []any{}, "usage": nil, "metadata": map[string]any{},
 		"max_output_tokens": nil, "text": map[string]any{"format": map[string]any{"type": "text"}},
 	}
+	if echo == nil {
+		return response
+	}
+	if echo.Instructions != "" {
+		response["instructions"] = echo.Instructions
+	}
+	if echo.PreviousResponseID != "" {
+		response["previous_response_id"] = echo.PreviousResponseID
+	}
+	if echo.Temperature != nil {
+		response["temperature"] = *echo.Temperature
+	}
+	if echo.TopP != nil {
+		response["top_p"] = *echo.TopP
+	}
+	if echo.MaxOutputTokens != nil {
+		response["max_output_tokens"] = *echo.MaxOutputTokens
+	}
+	if echo.ParallelToolCalls != nil {
+		response["parallel_tool_calls"] = *echo.ParallelToolCalls
+	}
+	if echo.Truncation != "" {
+		response["truncation"] = echo.Truncation
+	}
+	response["tool_choice"] = echoRaw(echo.ToolChoice, "auto")
+	response["metadata"] = echoRaw(echo.Metadata, map[string]any{})
+	response["reasoning"] = echoRaw(echo.Reasoning, response["reasoning"])
+	response["text"] = echoRaw(echo.Text, response["text"])
+	response["tools"] = echoRaw(echo.Tools, []any{})
+	return response
 }
 
 func responseUsage(usage llm.Usage) map[string]any {

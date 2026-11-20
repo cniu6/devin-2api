@@ -30,6 +30,22 @@ type Request struct {
 	MaxOutputTokens *int `json:"max_output_tokens,omitempty"`
 	// Temperature 是可选的采样温度。
 	Temperature *float64 `json:"temperature,omitempty"`
+	// TopP 是可选的核采样阈值。
+	TopP *float64 `json:"top_p,omitempty"`
+	// Seed 是可选的采样种子。
+	Seed *int64 `json:"seed,omitempty"`
+	// ToolChoice 是可选的工具调用约束（字符串或对象）。
+	ToolChoice json.RawMessage `json:"tool_choice,omitempty"`
+	// ParallelToolCalls 为 false 时禁止单轮并行工具调用。
+	ParallelToolCalls *bool `json:"parallel_tool_calls,omitempty"`
+	// Truncation 是可选的上下文截断策略，仅用于响应回显。
+	Truncation string `json:"truncation,omitempty"`
+	// Metadata 是可选的调用方元数据，仅在响应中原样回显。
+	Metadata json.RawMessage `json:"metadata,omitempty"`
+	// Reasoning 是可选的推理配置，仅在响应中原样回显。
+	Reasoning json.RawMessage `json:"reasoning,omitempty"`
+	// Text 是可选的文本格式配置，仅在响应中原样回显。
+	Text json.RawMessage `json:"text,omitempty"`
 	// PreviousResponseID 是上游 Responses 会话关联标识。
 	PreviousResponseID string `json:"previous_response_id,omitempty"`
 	// Store 控制服务端是否保留本次响应供后续 previous_response_id 引用。
@@ -69,6 +85,8 @@ type RequestOptions struct {
 	PreviousResponseID string
 	// Store 表示调用方是否希望服务端保留本次响应（OpenAI 默认 true）。
 	Store bool
+	// Echo 保存需要原样回显到响应体的请求侧字段（OpenAI 契约）。
+	Echo ResponseEcho
 }
 
 // DecodeRequest 将 OpenAI Responses JSON 请求转换为中间请求。
@@ -103,6 +121,19 @@ func DecodeRequest(data []byte) (AdaptedRequest, error) {
 	if err := context.Validate(); err != nil {
 		return AdaptedRequest{}, fmt.Errorf("validate adapted request: %w", err)
 	}
+
+	context.MaxTokens = request.MaxOutputTokens
+	context.Temperature = request.Temperature
+	context.TopP = request.TopP
+	context.Seed = request.Seed
+	if request.ParallelToolCalls != nil {
+		context.DisableParallelToolCalls = !*request.ParallelToolCalls
+	}
+	toolChoice, err := llm.ParseOpenAIToolChoice(request.ToolChoice)
+	if err != nil {
+		return AdaptedRequest{}, fmt.Errorf("tool_choice: %w", err)
+	}
+	context.ToolChoice = toolChoice
 	return AdaptedRequest{
 		Context: context,
 		Options: RequestOptions{
@@ -112,8 +143,34 @@ func DecodeRequest(data []byte) (AdaptedRequest, error) {
 			PreviousResponseID: request.PreviousResponseID,
 			// 未提供 store 时按 OpenAI 契约取 true。
 			Store: request.Store == nil || *request.Store,
+			Echo: ResponseEcho{
+				Instructions:       request.Instructions,
+				Temperature:        request.Temperature,
+				TopP:               request.TopP,
+				MaxOutputTokens:    request.MaxOutputTokens,
+				PreviousResponseID: request.PreviousResponseID,
+				ToolChoice:         request.ToolChoice,
+				ParallelToolCalls:  request.ParallelToolCalls,
+				Truncation:         request.Truncation,
+				Metadata:           request.Metadata,
+				Reasoning:          request.Reasoning,
+				Text:               request.Text,
+				Tools:              marshalToolsEcho(request.Tools),
+			},
 		},
 	}, nil
+}
+
+// marshalToolsEcho 把解析后的工具列表重新序列化，供响应体原样回显。
+func marshalToolsEcho(tools []Tool) json.RawMessage {
+	if len(tools) == 0 {
+		return nil
+	}
+	raw, err := json.Marshal(tools)
+	if err != nil {
+		return nil
+	}
+	return raw
 }
 
 func appendInputMessages(context *llm.RequestMessages, raw json.RawMessage) error {

@@ -69,10 +69,20 @@ func EncodeResponse(message *llm.AssistantMessage) ([]byte, error) {
 		model = "devin"
 	}
 	messageObj, toolCalls := messageToChat(message)
+	// 优先回显上游真实 id/时间戳（ResponseID/TimestampMS 在解码时保存），
+	// 没有才回退本地生成，避免凭空捏造。
+	responseID := message.ResponseID
+	if responseID == "" {
+		responseID = newChatResponseID()
+	}
+	createdAt := time.UnixMilli(message.TimestampMS).Unix()
+	if message.TimestampMS <= 0 {
+		createdAt = time.Now().Unix()
+	}
 	response := map[string]any{
-		"id":      newChatResponseID(),
+		"id":      responseID,
 		"object":  "chat.completion",
-		"created": time.Now().Unix(),
+		"created": createdAt,
 		"model":   model,
 		"choices": []any{map[string]any{
 			"index":         0,

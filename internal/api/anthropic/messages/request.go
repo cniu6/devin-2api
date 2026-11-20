@@ -105,6 +105,20 @@ func DecodeRequest(data []byte) (AdaptedRequest, error) {
 		return AdaptedRequest{}, fmt.Errorf("validate adapted request: %w", err)
 	}
 
+	if request.MaxTokens > 0 {
+		maxTokens := request.MaxTokens
+		context.MaxTokens = &maxTokens
+	}
+	context.Temperature = request.Temperature
+	context.TopP = request.TopP
+	context.TopK = request.TopK
+	context.StopPatterns = request.StopSequences
+	toolChoice, disableParallel, err := llm.ParseAnthropicToolChoice(request.ToolChoice)
+	if err != nil {
+		return AdaptedRequest{}, fmt.Errorf("tool_choice: %w", err)
+	}
+	context.ToolChoice = toolChoice
+	context.DisableParallelToolCalls = disableParallel
 	return AdaptedRequest{
 		Context: context,
 		Options: RequestOptions{

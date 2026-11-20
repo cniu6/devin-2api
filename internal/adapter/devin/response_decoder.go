@@ -327,9 +327,16 @@ func mapStopReason(reason devinproto.ExaCodeiumCommonPb_StopReason) llm.StopReas
 		devinproto.ExaCodeiumCommonPb_StopReason_ExaCodeiumCommonPb_StopReason_STOP_REASON_PARTIAL:
 		// INCOMPLETE/PARTIAL 都表示模型没有生成完整回复，按长度截断处理。
 		return llm.StopReasonLength
+	case devinproto.ExaCodeiumCommonPb_StopReason_ExaCodeiumCommonPb_StopReason_STOP_REASON_MAX_NEWLINES,
+		devinproto.ExaCodeiumCommonPb_StopReason_ExaCodeiumCommonPb_StopReason_STOP_REASON_MIN_LOG_PROB:
+		// 命中 token/换行/logprob 上限同属「被长度截断」，不能按正常 stop 报给客户端。
+		return llm.StopReasonLength
 	case devinproto.ExaCodeiumCommonPb_StopReason_ExaCodeiumCommonPb_StopReason_STOP_REASON_FUNCTION_CALL:
 		return llm.StopReasonToolUse
-	case devinproto.ExaCodeiumCommonPb_StopReason_ExaCodeiumCommonPb_StopReason_STOP_REASON_ERROR:
+	case devinproto.ExaCodeiumCommonPb_StopReason_ExaCodeiumCommonPb_StopReason_STOP_REASON_ERROR,
+		devinproto.ExaCodeiumCommonPb_StopReason_ExaCodeiumCommonPb_StopReason_STOP_REASON_CONTENT_FILTER,
+		devinproto.ExaCodeiumCommonPb_StopReason_ExaCodeiumCommonPb_StopReason_STOP_REASON_NONFINITE_LOGIT_OR_PROB:
+		// 内容过滤/异常终止是失败而非正常结束。
 		return llm.StopReasonError
 	default:
 		return llm.StopReasonStop

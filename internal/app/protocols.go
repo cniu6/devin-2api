@@ -39,6 +39,8 @@ type protocolOptions struct {
 	PreviousResponseID string
 	// Store 只有 Responses 协议会填：false 表示调用方拒绝服务端保留会话。
 	Store bool
+	// Echo 只有 Responses 协议会填：需要原样回显到响应体的请求侧字段。
+	Echo *responses.ResponseEcho
 }
 
 // responsesProtocol 实现 OpenAI Responses API 协议。
@@ -49,18 +51,19 @@ func (p responsesProtocol) NewStreamEncoder(model string, _ bool) streamEncoder 
 }
 
 func (p responsesProtocol) EncodeFinal(message *llm.AssistantMessage) ([]byte, error) {
-	return responses.EncodeResponse(message)
+	return responses.EncodeResponse(message, true, nil)
 }
 
-// EncodeFinalWithStore 编码非流式响应，并如实回显 store。
-func (p responsesProtocol) EncodeFinalWithStore(message *llm.AssistantMessage, store bool) ([]byte, error) {
-	return responses.EncodeResponse(message, store)
+// EncodeFinalWithEcho 编码非流式响应，并如实回显 store 与请求侧字段。
+func (p responsesProtocol) EncodeFinalWithEcho(message *llm.AssistantMessage, store bool, echo *responses.ResponseEcho) ([]byte, error) {
+	return responses.EncodeResponse(message, store, echo)
 }
 
-// NewResponsesStreamEncoder 创建流式编码器，并把真实的 store 值传给它。
-func NewResponsesStreamEncoder(model string, store bool) streamEncoder {
+// NewResponsesStreamEncoder 创建流式编码器，并把真实的 store 值和回显字段传给它。
+func NewResponsesStreamEncoder(model string, store bool, echo *responses.ResponseEcho) streamEncoder {
 	encoder := responses.NewStreamEncoder(model)
 	encoder.SetStore(store)
+	encoder.SetEcho(echo)
 	return &responsesStreamAdapter{encoder}
 }
 
@@ -170,6 +173,7 @@ func decodeResponsesRequest(data []byte) (llm.RequestMessages, protocolOptions, 
 		// 这是 store 从解码层走进 handler 的唯一通路；丢掉它会让
 		// 调用方的 store:false 被静默忽略。
 		Store: adapted.Options.Store,
+		Echo:  &adapted.Options.Echo,
 	}, nil
 }
 

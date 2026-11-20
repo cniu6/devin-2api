@@ -306,7 +306,7 @@ func (a *Adapter) catalog(ctx context.Context) ([]adapter.ModelInfo, map[string]
 	models := make([]adapter.ModelInfo, 0, len(resp.Msg.GetClientModelConfigs()))
 	meta := make(map[string]modelMeta, len(resp.Msg.GetClientModelConfigs()))
 	seen := make(map[string]struct{}, len(resp.Msg.GetClientModelConfigs()))
-	add := func(c *devinproto.ExaCodeiumCommonPb_ClientModelConfig) {
+	add := func(c *devinproto.ExaCodeiumCommonPb_ClientModelConfig, command bool) {
 		uid := c.GetModelUid()
 		if uid == "" && c.GetModelOrAlias() != nil {
 			uid = c.GetModelOrAlias().GetModelUid()
@@ -335,12 +335,32 @@ func (a *Adapter) catalog(ctx context.Context) ([]adapter.ModelInfo, map[string]
 				ownedBy = "meta"
 			}
 		}
-		models = append(models, adapter.ModelInfo{
+		info := adapter.ModelInfo{
 			ID: uid, Created: now, OwnedBy: ownedBy, SupportsImages: c.GetSupportsImages(),
-		})
+			Label: c.GetLabel(), Description: c.GetDescription(), Family: m.family,
+			Provider:         enumShort(c.GetProvider().String(), "MODEL_PROVIDER_"),
+			APIProvider:      enumShort(c.GetApiProvider().String(), "API_PROVIDER_"),
+			CostTier:         strings.ToLower(enumShort(c.GetModelCostTier().String(), "MODEL_COST_TIER_")),
+			PricingType:      enumShort(c.GetPricingType().String(), "MODEL_PRICING_TYPE_"),
+			CreditMultiplier: float64(c.GetCreditMultiplier()), MaxTokens: int64(c.GetMaxTokens()),
+			BetaWarning: c.GetBetaWarningMessage(),
+			IsBeta:      c.GetIsBeta(), IsNew: c.GetIsNew(), IsRecommended: c.GetIsRecommended(),
+			IsPremium: c.GetIsPremium(), IsCapacityLimited: c.GetIsCapacityLimited(),
+			IsCommand: command,
+		}
+		if info.Provider == "13" {
+			info.Provider = "META"
+		}
+		if ps := c.GetPromoStatus(); ps != nil && ps.GetIsActive() {
+			info.Promo = &adapter.ModelPromo{Label: ps.GetLabel()}
+			if ed := ps.GetEndDate(); ed != nil {
+				info.Promo.EndDate = ed.GetSeconds()
+			}
+		}
+		models = append(models, info)
 	}
 	for _, c := range resp.Msg.GetClientModelConfigs() {
-		add(c)
+		add(c, false)
 	}
 	// 合并命令模型目录（commit 信息等命令用模型，如 MODEL_PRIVATE_2 "Claude 4.5 Sonnet"）：
 	// 不在 chat picker 中但可直接调用；失败不影响主目录。
@@ -348,7 +368,7 @@ func (a *Adapter) catalog(ctx context.Context) ([]adapter.ModelInfo, map[string]
 		Metadata: a.metadata(),
 	})); err == nil {
 		for _, c := range cmdResp.Msg.GetClientModelConfigs() {
-			add(c)
+			add(c, true)
 		}
 	}
 	// 用户显式配置的 model（如 gpt5.6）即使不在 Devin 返回的列表中，也应可被发现和调用。
@@ -395,7 +415,7 @@ func (a *Adapter) metadata() *devinproto.ExaCodeiumCommonPb_Metadata {
 		IdeName:          proto.String(clientName),
 		IdeVersion:       proto.String(clientVersion),
 		Locale:           proto.String("en"),
-		Os:               proto.String("win"),
+		Os:               proto.String("mac"),
 	}
 }
 
@@ -428,19 +448,39 @@ func buildRequest(request llm.RequestMessages, config Config) (*devinproto.GetCh
 		Os:               proto.String("mac"),
 		F:                proto.String(fingerprint),
 	}
+	configuration := &devinproto.ExaCodeiumCommonPb_CompletionConfiguration{
+		NumCompletions: proto.Uint64(1),
+		MaxTokens:      proto.Uint64(128000),
+		MaxNewlines:    proto.Uint64(400),
+		Temperature:    proto.Float64(1),
+		TopK:           proto.Uint64(40),
+		TopP:           proto.Float64(0.95),
+	}
+	// 客户端显式提供的生成参数优先透传；缺省沿用 IDE 默认采样配置。
+	if request.MaxTokens != nil && *request.MaxTokens > 0 {
+		configuration.MaxTokens = proto.Uint64(uint64(*request.MaxTokens))
+	}
+	if request.Temperature != nil {
+		configuration.Temperature = proto.Float64(*request.Temperature)
+	}
+	if request.TopP != nil {
+		configuration.TopP = proto.Float64(*request.TopP)
+	}
+	if request.TopK != nil && *request.TopK > 0 {
+		configuration.TopK = proto.Uint64(uint64(*request.TopK))
+	}
+	if len(request.StopPatterns) > 0 {
+		configuration.StopPatterns = request.StopPatterns
+	}
+	if request.Seed != nil {
+		configuration.Seed = proto.Uint64(uint64(*request.Seed))
+	}
 	result := &devinproto.GetChatMessageRequest{
-		Metadata:     metadata,
-		Prompt:       proto.String(sanitizeSystemPrompt(withToolDescriptions(request.SystemPrompt, request.Tools))),
-		ChatModelUid: proto.String(config.Model),
-		RequestType:  devinproto.ChatMessageRequestType_CHAT_MESSAGE_REQUEST_TYPE_CASCADE.Enum(),
-		Configuration: &devinproto.ExaCodeiumCommonPb_CompletionConfiguration{
-			NumCompletions: proto.Uint64(1),
-			MaxTokens:      proto.Uint64(128000),
-			MaxNewlines:    proto.Uint64(400),
-			Temperature:    proto.Float64(1),
-			TopK:           proto.Uint64(40),
-			TopP:           proto.Float64(0.95),
-		},
+		Metadata:      metadata,
+		Prompt:        proto.String(sanitizeSystemPrompt(withToolDescriptions(request.SystemPrompt, request.Tools))),
+		ChatModelUid:  proto.String(config.Model),
+		RequestType:   devinproto.ChatMessageRequestType_CHAT_MESSAGE_REQUEST_TYPE_CASCADE.Enum(),
+		Configuration: configuration,
 		TrajectoryReference: &devinproto.ExaCortexPb_CortexTrajectoryReference{
 			TrajectoryId:   proto.String(trajectoryID),
 			TrajectoryType: devinproto.ExaCortexPb_CortexTrajectoryType_ExaCortexPb_CortexTrajectoryType_CORTEX_TRAJECTORY_TYPE_CASCADE.Enum(),
@@ -474,7 +514,54 @@ func buildRequest(request llm.RequestMessages, config Config) (*devinproto.GetCh
 		}
 		result.Tools = append(result.Tools, converted)
 	}
+	if request.DisableParallelToolCalls {
+		result.DisableParallelToolCalls = proto.Bool(true)
+	}
+	if choice := convertToolChoice(request.ToolChoice); choice != nil {
+		result.ToolChoice = choice
+	}
 	return result, nil
+}
+
+// enumShort 从 proto 枚举全名提取短名：
+// "ExaCodeiumCommonPb_ModelProvider_MODEL_PROVIDER_ANTHROPIC" → "ANTHROPIC"；
+// 未匹配前缀时退化为最后一个下划线分段；"UNSPECIFIED" 与空串按空处理。
+func enumShort(full, prefix string) string {
+	if full == "" {
+		return ""
+	}
+	if idx := strings.Index(full, prefix); idx >= 0 {
+		full = full[idx+len(prefix):]
+	} else if i := strings.LastIndex(full, "_"); i >= 0 && i+1 < len(full) {
+		full = full[i+1:]
+	}
+	if full == "UNSPECIFIED" {
+		return ""
+	}
+	return full
+}
+
+// convertToolChoice 把归一化工具约束映射为上游 ChatToolChoice：
+// auto/none/required 走 option_name 枚举语义，named 走 tool_name。
+func convertToolChoice(choice *llm.ToolChoice) *devinproto.ExaChatPb_ChatToolChoice {
+	if choice == nil {
+		return nil
+	}
+	if choice.Mode == llm.ToolChoiceNamed {
+		if choice.ToolName == "" {
+			return nil
+		}
+		return &devinproto.ExaChatPb_ChatToolChoice{
+			Choice: &devinproto.ExaChatPb_ChatToolChoice_ToolName{ToolName: choice.ToolName},
+		}
+	}
+	mode := choice.Mode
+	if mode == "" {
+		mode = llm.ToolChoiceAuto
+	}
+	return &devinproto.ExaChatPb_ChatToolChoice{
+		Choice: &devinproto.ExaChatPb_ChatToolChoice_OptionName{OptionName: string(mode)},
+	}
 }
 
 // convertMessage 将中间消息转为 Devin ChatMessagePrompt。

@@ -25,6 +25,8 @@ type Request struct {
 	Temperature         *float64        `json:"temperature,omitempty"`
 	TopP                *float64        `json:"top_p,omitempty"`
 	Stop                json.RawMessage `json:"stop,omitempty"`
+	Seed                *int64          `json:"seed,omitempty"`
+	ParallelToolCalls   *bool           `json:"parallel_tool_calls,omitempty"`
 	ResponseFormat      json.RawMessage `json:"response_format,omitempty"`
 }
 
@@ -122,6 +124,23 @@ func DecodeRequest(data []byte) (AdaptedRequest, error) {
 	if maxTokens == nil {
 		maxTokens = request.MaxTokens
 	}
+	context.MaxTokens = maxTokens
+	context.Temperature = request.Temperature
+	context.TopP = request.TopP
+	context.Seed = request.Seed
+	if request.ParallelToolCalls != nil {
+		context.DisableParallelToolCalls = !*request.ParallelToolCalls
+	}
+	stopPatterns, err := parseStopPatterns(request.Stop)
+	if err != nil {
+		return AdaptedRequest{}, err
+	}
+	context.StopPatterns = stopPatterns
+	toolChoice, err := llm.ParseOpenAIToolChoice(request.ToolChoice)
+	if err != nil {
+		return AdaptedRequest{}, fmt.Errorf("tool_choice: %w", err)
+	}
+	context.ToolChoice = toolChoice
 	return AdaptedRequest{
 		Context: context,
 		Options: RequestOptions{
@@ -131,6 +150,22 @@ func DecodeRequest(data []byte) (AdaptedRequest, error) {
 			Temperature:     request.Temperature,
 		},
 	}, nil
+}
+
+// parseStopPatterns 解析 OpenAI 的 stop 字段：字符串或字符串数组。
+func parseStopPatterns(raw json.RawMessage) ([]string, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var single string
+	if err := json.Unmarshal(raw, &single); err == nil {
+		return []string{single}, nil
+	}
+	var list []string
+	if err := json.Unmarshal(raw, &list); err != nil {
+		return nil, fmt.Errorf("stop must be a string or string array: %w", err)
+	}
+	return list, nil
 }
 
 func appendMessages(context *llm.RequestMessages, messages []Message) error {

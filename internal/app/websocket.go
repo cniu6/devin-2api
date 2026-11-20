@@ -11,11 +11,9 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/leookun/devin-2api/internal/llm"
 )
 
 var upgrader = websocket.Upgrader{
@@ -74,6 +72,23 @@ func (w *wsResponseWriter) Flush() {
 	// 但实际消息在 Write 遇到 "\n\n" 时已经发送，这里不需要额外动作。
 }
 
+// flushRemainder 把缓冲区里不足一个 SSE 帧的剩余内容作为文本帧发出。
+// 非流式错误路径（writeJSONError/writeLoggedError）只写单行 JSON+"\n"，
+// 不含 "\n\n" 分隔——不冲刷的话错误永远不会到达客户端，连接只能静默关闭。
+func (w *wsResponseWriter) flushRemainder() {
+	if w.err != nil {
+		return
+	}
+	rest := bytes.TrimSpace(w.buf)
+	w.buf = nil
+	if len(rest) == 0 {
+		return
+	}
+	if err := w.conn.WriteMessage(websocket.TextMessage, rest); err != nil {
+		w.err = err
+	}
+}
+
 // writeFrame 解析单条 SSE 帧，把 data 行作为 JSON 文本消息发出。
 // 如果遇到 event: error 事件，同样只把 data 发回，让客户端按 OpenAI 协议处理。
 func (w *wsResponseWriter) writeFrame(frame []byte) error {
@@ -125,6 +140,11 @@ func (application *App) responsesWebSocket(writer http.ResponseWriter, request *
 		log.Printf("websocket parse request failed: %v", err)
 		return
 	}
+	// OpenAI 包装格式 {"type":"response.create"|"response.append","response":{...}}：
+	// 真正的请求字段在 response 子对象里；不解包会因缺 model 解码失败（且错误静默）。
+	if inner, ok := payload["response"].(map[string]any); ok && payload["type"] != nil {
+		payload = inner
+	}
 	payload["stream"] = true
 	body, err = json.Marshal(payload)
 	if err != nil {
@@ -157,6 +177,8 @@ func (application *App) responsesWebSocket(writer http.ResponseWriter, request *
 
 	wsWriter := newWSResponseWriter(conn)
 	application.createResponses(wsWriter, innerRequest)
+	// 冲刷非 SSE 残余（错误 JSON 没有 "\n\n" 分隔，不冲就到不了客户端）。
+	wsWriter.flushRemainder()
 
 	// 如果 createResponses 没有发送 completed/error，尝试补一个干净的关闭。
 	if wsWriter.err == nil {
@@ -174,18 +196,4 @@ func (application *App) createResponsesWebSocket(writer http.ResponseWriter, req
 		return
 	}
 	application.responsesWebSocket(writer, request)
-}
-
-// isWebSocketRequest 判断请求是否为 OpenAI Responses WebSocket upgrade。
-// 同时检查 Upgrade 头和 Sec-WebSocket-Protocol（OpenAI WebSocket 可能带此协议头）。
-func isWebSocketRequest(r *http.Request) bool {
-	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
-}
-
-// ensureAssistantMessage 保证最终消息不为空；辅助处理 codex 的 SSE 转换。
-func ensureAssistantMessage(message *llm.AssistantMessage, fallback *llm.AssistantMessage) *llm.AssistantMessage {
-	if message != nil {
-		return message
-	}
-	return fallback
 }

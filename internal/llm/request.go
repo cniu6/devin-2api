@@ -40,6 +40,44 @@ type RequestMessages struct {
 	Messages []Message
 	// Tools 是本次请求允许模型调用的工具定义。
 	Tools []ToolDefinition
+	// ToolChoice 是调用方对工具调用的约束；nil 表示交给模型自行决定。
+	ToolChoice *ToolChoice
+	// DisableParallelToolCalls 为 true 时禁止模型单轮并行发起多个工具调用。
+	DisableParallelToolCalls bool
+	// MaxTokens 是可选的输出 token 上限；nil 表示由适配器应用默认值。
+	MaxTokens *int
+	// Temperature 是可选的采样温度；nil 表示由适配器应用默认值。
+	Temperature *float64
+	// TopP 是可选的核采样阈值；nil 表示由适配器应用默认值。
+	TopP *float64
+	// TopK 是可选的 top-k 采样阈值；nil 表示由适配器应用默认值。
+	TopK *int
+	// StopPatterns 是可选的停止序列；命中任一序列时上游应结束生成。
+	StopPatterns []string
+	// Seed 是可选的采样种子；nil 表示由上游自行选择。
+	Seed *int64
+}
+
+// ToolChoiceMode 描述工具调用约束的模式。
+type ToolChoiceMode string
+
+const (
+	// ToolChoiceAuto 表示模型自行决定是否调用工具。
+	ToolChoiceAuto ToolChoiceMode = "auto"
+	// ToolChoiceNone 表示禁止模型调用任何工具。
+	ToolChoiceNone ToolChoiceMode = "none"
+	// ToolChoiceRequired 表示模型必须调用某个工具。
+	ToolChoiceRequired ToolChoiceMode = "required"
+	// ToolChoiceNamed 表示模型必须调用指定名称的工具。
+	ToolChoiceNamed ToolChoiceMode = "named"
+)
+
+// ToolChoice 是跨协议归一化的工具调用约束。
+type ToolChoice struct {
+	// Mode 是约束模式；空值等价于 ToolChoiceAuto。
+	Mode ToolChoiceMode
+	// ToolName 是 ToolChoiceNamed 模式下必须调用的工具名。
+	ToolName string
 }
 
 // Message 是用户、助手或工具结果消息的统一接口。
