@@ -40,6 +40,12 @@ type ModelInfo struct {
 	CreditMultiplier float64
 	// MaxTokens 是上游宣称的上下文窗口大小。
 	MaxTokens int64
+	// MaxOutputTokens 是上游宣称的单次最大输出 token 数；0 表示未下发。
+	MaxOutputTokens int64
+	// SupportsToolCalls 是上游 model_features 声明的工具调用能力。
+	SupportsToolCalls bool
+	// SupportsThinking 是上游 model_features 声明的思考/推理能力。
+	SupportsThinking bool
 	// BetaWarning 是 beta 模型的上游警告文案。
 	BetaWarning string
 	// Promo 非空表示该模型有进行中的促销。

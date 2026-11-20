@@ -392,6 +392,15 @@ func (a *Adapter) catalog(ctx context.Context) ([]adapter.ModelInfo, map[string]
 			IsPremium: c.GetIsPremium(), IsCapacityLimited: c.GetIsCapacityLimited(),
 			IsCommand: command,
 		}
+		// model_info 携带能力声明；顶层 supports_images 优先，缺失时回退 features。
+		if mi := c.GetModelInfo(); mi != nil {
+			info.MaxOutputTokens = int64(mi.GetMaxOutputTokens())
+			if features := mi.GetModelFeatures(); features != nil {
+				info.SupportsToolCalls = features.GetSupportsToolCalls()
+				info.SupportsThinking = features.GetSupportsThinking()
+				info.SupportsImages = info.SupportsImages || features.GetSupportsImages()
+			}
+		}
 		if info.Provider == "13" {
 			info.Provider = "META"
 		}

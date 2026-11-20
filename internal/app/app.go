@@ -198,7 +198,18 @@ func modelEntry(m adapter.ModelInfo) map[string]any {
 		entry["credit_multiplier"] = m.CreditMultiplier
 	}
 	if m.MaxTokens > 0 {
+		// context_window 与 context_length（OpenRouter 命名）同一语义，两种客户端都能读到。
 		entry["context_window"] = m.MaxTokens
+		entry["context_length"] = m.MaxTokens
+	}
+	if m.MaxOutputTokens > 0 {
+		entry["max_output_tokens"] = m.MaxOutputTokens
+	}
+	if m.SupportsToolCalls {
+		entry["supports_tool_calls"] = true
+	}
+	if m.SupportsThinking {
+		entry["supports_thinking"] = true
 	}
 	if m.Promo != nil {
 		promo := map[string]any{"active": true, "label": m.Promo.Label}

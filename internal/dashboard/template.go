@@ -155,6 +155,9 @@ tr.fam:hover td{background:#171e30}
 .badge-beta{background:#fde04714;border-color:#fde04738;color:#fde047}
 .badge-fast{background:#22d3ee14;border-color:#22d3ee38;color:var(--cyan)}
 .badge-img{background:#a78bfa14;border-color:#a78bfa38;color:#a78bfa}
+.badge-tool{background:#34d39914;border-color:#34d39938;color:#34d399}
+.badge-think{background:#38bdf814;border-color:#38bdf838;color:#38bdf8}
+.ctx-num{font-weight:600}
 .badge-new{background:#34d39914;border-color:#34d39938;color:#34d399}
 .badge-premium{background:#f59e0b14;border-color:#f59e0b38;color:#f59e0b}
 .badge-rec{background:#93c5fd14;border-color:#93c5fd38;color:#93c5fd}
@@ -268,10 +271,11 @@ tr.fam:hover td{background:#171e30}
 <th>Output $/1M</th>
 <th>最终价格</th>
 <th>计费</th>
+<th>上下文</th>
 <th>标签</th>
 </tr>
 </thead>
-<tbody><tr><td colspan="12" class="loading">加载中...</td></tr></tbody>
+<tbody><tr><td colspan="13" class="loading">加载中...</td></tr></tbody>
 </table>
 </div>
 <div class="note">
@@ -513,6 +517,20 @@ const n=Number(m.credit_multiplier);
 return 'x'+(n%1?n.toFixed(1):String(n));
 }
 
+// fmtCtx 把 token 数缩写为 1M/400K/32K（统计页的 fmtTok 是 2 位小数版，语义不同，勿复用）。
+function fmtCtx(v){
+v=Number(v)||0;
+if(v<=0) return '';
+if(v>=1e6){const x=v/1e6;return (x===Math.floor(x)?x:x.toFixed(1))+'M'}
+if(v>=1e3){const x=v/1e3;return (x===Math.floor(x)?x:x.toFixed(1))+'K'}
+return String(v)
+}
+// ctxCell 上下文列：主行上下文窗口，副行最大输出。
+function ctxCell(m){
+const w=fmtCtx(m.max_tokens),o=fmtCtx(m.max_output_tokens);
+if(!w&&!o) return '<span class="muted">—</span>';
+return '<span class="ctx-num">'+(w||'—')+'</span>'+(o?'<div class="muted" style="font-size:10px">输出 '+o+'</div>':'')
+}
 function money(v){
 if(v==null||v===undefined||v==='') return '<span class="muted">—</span>';
 const n=Number(v);
@@ -578,7 +596,9 @@ else if(m.cost_tier==='high') b+='<span class="badge badge-high">HIGH</span>';
 if(m.is_beta) b+='<span class="badge badge-beta">BETA</span>';
 if(m.is_new) b+='<span class="badge badge-new">NEW</span>';
 if(m.fast&&m.fast.active) b+='<span class="badge badge-fast" title="'+esc(m.fast.tooltip||'')+'">FAST</span>';
-if(m.supports_images) b+='<span class="badge badge-img">img</span>';
+if(m.supports_images) b+='<span class="badge badge-img" title="支持图片输入">图片</span>';
+if(m.supports_tools) b+='<span class="badge badge-tool" title="支持工具调用">工具</span>';
+if(m.supports_thinking) b+='<span class="badge badge-think" title="支持思考/推理">思考</span>';
 if(m.is_premium) b+='<span class="badge badge-premium">Premium</span>';
 if(m.is_recommended) b+='<span class="badge badge-rec">推荐</span>';
 if(m.is_capacity_limited) b+='<span class="badge badge-cap">限容</span>';
@@ -671,7 +691,7 @@ const tbody=document.querySelector('#modelTable tbody');
 const promoCount=allModels.filter(m=>m.promo&&m.promo.active).length;
 document.getElementById('stats').innerHTML='显示 <b>'+models.length+'</b> / 共 '+allModels.length+' 个模型'+(promoCount?(' · 促销中 <b>'+promoCount+'</b>'):'');
 if(!models.length){
-tbody.innerHTML='<tr><td colspan="12" class="loading">无匹配模型</td></tr>';
+tbody.innerHTML='<tr><td colspan="13" class="loading">无匹配模型</td></tr>';
 return;
 }
 if(merge){
@@ -698,6 +718,7 @@ html+='<td>'+money(m.price_cached)+'</td>';
 html+='<td>'+money(m.price_output)+'</td>';
 html+='<td>'+finalPrice(m)+'</td>';
 html+='<td class="mono">'+esc(m.pricing_type||'-')+'</td>';
+html+='<td>'+ctxCell(m)+'</td>';
 html+='<td>'+badges(m)+'</td>';
 html+='</tr>';
 });
@@ -762,6 +783,7 @@ famPrice='<span class="price">'+(multLo===multHi?('x'+trimN(multLo)):('x'+trimN(
 }
 html+='<td>'+(one?finalPrice(m):famPrice)+'</td>';
 html+='<td class="mono">'+esc(pricings.join(' / ')||'-')+'</td>';
+html+='<td>'+ctxCell({max_tokens:Math.max(...mem.map(x=>x.max_tokens||0)),max_output_tokens:Math.max(...mem.map(x=>x.max_output_tokens||0))})+'</td>';
 html+='<td>'+badges(m)+(one?'':'<div class="muted" style="font-size:10px;margin-top:2px">'+mem.slice(1).map(x=>esc(x.label||x.uid)).join(' · ')+'</div>')+'</td>';
 html+='</tr>';
 });
