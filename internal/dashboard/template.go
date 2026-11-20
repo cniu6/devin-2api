@@ -106,12 +106,15 @@ body{font-family:"Segoe UI",system-ui,-apple-system,"Microsoft YaHei",sans-serif
 .ring-center{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
 .ring-num{font-size:11px;font-weight:700;line-height:1.2}
 .ring-dim{font-size:9px;color:var(--faint);font-weight:400}
-.gift{position:relative;display:inline-block;margin-left:4px;vertical-align:-2px;cursor:default}
-.gift svg{width:13px;height:13px;display:block}
-.gift .pop{display:none;position:absolute;left:50%;top:-8px;transform:translate(-50%,-100%);z-index:60;min-width:180px;background:#1a2030;border:1px solid #c084fc55;border-radius:8px;padding:9px 11px;font-size:11px;line-height:1.9;color:var(--text);box-shadow:0 8px 28px rgba(0,0,0,.6);white-space:nowrap}
-.gift:hover .pop{display:block}
+.gift{position:relative;display:inline-block;margin-left:4px;vertical-align:-2px;cursor:pointer}
+.gift svg{width:13px;height:13px;display:block;pointer-events:none}
+.gift.on svg{filter:drop-shadow(0 0 3px #c084fc)}
+.gift .pop{display:none;position:fixed;left:0;top:0;z-index:80;min-width:190px;max-width:280px;background:#1a2030;border:1px solid #c084fc55;border-radius:8px;padding:9px 11px;font-size:11px;line-height:1.9;color:var(--text);box-shadow:0 8px 28px rgba(0,0,0,.6);white-space:nowrap;cursor:text;user-select:text;text-align:left}
+.gift.on .pop{display:block}
 .gift .pop .pt{font-weight:700;color:#d8b4fe;margin-bottom:2px}
 .gift .pop .pk{color:var(--mut);display:inline-block;min-width:34px}
+.gift .pop .pop-copy{float:right;color:var(--acc);font-size:10px;cursor:pointer;user-select:none;padding:0 2px}
+.gift .pop .pop-copy:hover{color:#aab4ff;text-decoration:underline}
 .strike{color:var(--faint);text-decoration:line-through;text-decoration-color:#f87171}
 .stat-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(148px,1fr));gap:8px;margin-bottom:12px}
 .stat-cards .card .value{font-size:16px}
@@ -308,10 +311,7 @@ const color=p>50?'#4ade80':p>20?'#fbbf24':'#f87171';
 let countdown='';
 if(resetUnix&&Number(resetUnix)>0){
 const diff=Number(resetUnix)*1000-Date.now();
-if(diff>0){
-const d=Math.floor(diff/86400000),h=Math.floor(diff%86400000/3600000),m=Math.floor(diff%3600000/60000);
-if(d>0){countdown=d+'d '+h+'h '+m+'m'}else if(h>0){countdown=h+'h '+m+'m'}else{countdown=m+'m'}
-}else{countdown='已重置'}
+countdown=diff>0?fmtRemain(diff):'已重置';
 }
 // 环内数值：有总量时显示 剩余/总量，配额制（百分比）回退显示 剩余%/100
 let inside;
@@ -520,20 +520,17 @@ if(Number.isNaN(n)) return '<span class="muted">—</span>';
 return '<span class="price">$'+n.toFixed(n>=10?1:n>=1?2:3)+'</span>';
 }
 
-// promoInfo 生成优惠文案与截止倒计时
-function promoInfo(m){
-if(!(m.promo&&m.promo.active)) return null;
-let tail='',tip='';
-if(m.promo.end_date){
-const diff=new Date(m.promo.end_date).getTime()-Date.now();
-tip='截止 '+new Date(m.promo.end_date).toLocaleString();
-if(diff>0){
-const d=Math.floor(diff/864e5),h=Math.floor(diff%864e5/36e5),mi=Math.floor(diff%36e5/6e4);
-if(d>0){tail='·剩'+d+'d'}else if(h>0){tail='·剩'+h+'h'}else{tail='·剩'+mi+'m'}
-}else{tail='·已结束'}
+// fmtRemain 毫秒差 → 中文剩余时长（最多两个单位：4天5小时 / 12小时30分 / 35分）
+function fmtRemain(ms){
+ms=Number(ms)||0;
+if(ms<=0) return '已结束';
+const d=Math.floor(ms/864e5),h=Math.floor(ms%864e5/36e5),m=Math.floor(ms%36e5/6e4);
+if(d>0) return d+'天'+(h?h+'小时':'');
+if(h>0) return h+'小时'+(m?m+'分':'');
+if(m>0) return m+'分';
+return '不足1分';
 }
-return {tail:tail,tip:tip};
-}
+
 
 // discountRate 从促销文案解析折扣率："83% off"→0.83，"7折"→0.3；解析不出返回 null
 function discountRate(label){
@@ -550,25 +547,26 @@ if(iv==null&&ov==null) return null;
 return (iv!=null?('$'+fmtP(iv*scale)):'—')+' / '+(ov!=null?('$'+fmtP(ov*scale)):'—');
 }
 const GIFT_SVG='<svg viewBox="0 0 24 24" fill="none" stroke="#c084fc" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="8" width="18" height="4" rx="1"/><path d="M12 8v13"/><path d="M19 12v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-7"/><path d="M7.5 8a2.5 2.5 0 0 1 0-5C11 3 12 8 12 8s1-5 4.5-5a2.5 2.5 0 0 1 0 5"/></svg>';
-// giftIcon 在模型名旁渲染礼物图标，悬浮显示促销详情（起止/剩余/原价划线/现价）
+// giftIcon 在模型名旁渲染礼物图标；弹出层由 JS 定位（fixed，不被表格裁切），可悬停选中复制
 function giftIcon(m){
 if(!(m.promo&&m.promo.active)) return '';
 const end=m.promo.end_date?new Date(m.promo.end_date):null;
-const pi=promoInfo(m);
-let pop='<div class="pop">';
-pop+='<div class="pt">'+(m.promo.label?esc(m.promo.label):'限时优惠')+'</div>';
-pop+='<div><span class="pk">开始</span>—</div>';
-pop+='<div><span class="pk">到期</span>'+(end?end.toLocaleString():'—')+'</div>';
-pop+='<div><span class="pk">剩余</span>'+(pi&&pi.tail?esc(pi.tail.slice(1)):'—')+'</div>';
+const title=m.promo.label||'限时优惠';
+const remain=end?fmtRemain(end.getTime()-Date.now()):'—';
+const rows=[['开始','—'],['到期',end?end.toLocaleString():'—'],['剩余',remain]];
 const disc=discountRate(m.promo.label||'');
 if(disc){
 const orig=pricePair(m,1)||(m.credit_multiplier>0?('x'+trimN(m.credit_multiplier)):null);
-if(orig) pop+='<div><span class="pk">原价</span><span class="strike">'+orig+'</span></div>';
+if(orig) rows.push(['原价',orig,'strike']);
 }
-const curPair=pricePair(m,discountFactor(m))||(m.credit_multiplier>0?('x'+trimN(m.credit_multiplier*discountFactor(m))):null);
-if(curPair) pop+='<div><span class="pk">现价</span><span class="price-disc">'+curPair+'</span></div>';
+const cur=pricePair(m,discountFactor(m))||(m.credit_multiplier>0?('x'+trimN(m.credit_multiplier*discountFactor(m))):null);
+if(cur) rows.push(['现价',cur,'price-disc']);
+const copyTxt=title+'\n'+rows.map(r=>r[0]+'：'+r[1]).join('\n');
+let pop='<div class="pop" data-copy="'+esc(copyTxt)+'"><div class="pt">'+esc(title)+'<span class="pop-copy">复制</span></div>';
+rows.forEach(r=>{pop+='<div><span class="pk">'+r[0]+'</span><span'+(r[2]?(' class="'+r[2]+'"'):'')+'>'+esc(r[1])+'</span></div>'});
+pop+='<div style="color:var(--faint);font-size:9px;margin-top:2px">点击图标钉住，可复制文字</div>';
 pop+='</div>';
-return '<span class="gift">'+GIFT_SVG+pop+'</span>';
+return '<span class="gift" title="促销详情">'+GIFT_SVG+pop+'</span>';
 }
 
 function badges(m){
@@ -682,7 +680,7 @@ return;
 }
 let html='';
 models.forEach((m,i)=>{
-const dimTip=(m.dimensions||[]).map(d=>d.label+': '+d.value+(d.min||d.max?(' (min '+d.min+' ~ max '+d.max+')'):'')+' / '+(d.denominator||'')).join(' | ');
+const dimTip=(m.dimensions||[]).map(d=>d.label+': '+d.value+(d.min||d.max?('（最小 '+d.min+' ~ 最大 '+d.max+'）'):'')+' / '+(d.denominator||'')).join(' | ');
 const title=[m.description,m.family?('系列: '+m.family):'',m.max_tokens?('上下文上限: '+m.max_tokens+' tokens'):'',dimTip,m.beta_warning||''].filter(Boolean).join(' | ');
 html+='<tr title="'+esc(title)+'">';
 html+='<td class="muted">'+(i+1)+'</td>';
@@ -818,18 +816,18 @@ if(n>=1e6) return (n/1e6).toFixed(2)+'M';
 if(n>=1e3) return (n/1e3).toFixed(1)+'K';
 return String(n);
 }
-// fmtDur 秒数 → Xd Xh Xm
+// fmtDur 秒数 → 中文时长（在线时长用：3天2小时 / 2小时5分 / 5分30秒 / 45秒）
 function fmtDur(sec){
 sec=Number(sec)||0;
 const d=Math.floor(sec/86400),h=Math.floor(sec%86400/3600),m=Math.floor(sec%3600/60),s=Math.floor(sec%60);
-if(d>0) return d+'d '+h+'h';
-if(h>0) return h+'h '+m+'m';
-if(m>0) return m+'m '+s+'s';
-return s+'s';
+if(d>0) return d+'天'+(h?h+'小时':'');
+if(h>0) return h+'小时'+(m?m+'分':'');
+if(m>0) return m+'分'+(s?s+'秒':'');
+return s+'秒';
 }
 function fmtMS(ms){
 ms=Number(ms)||0;
-return ms>=1000?((ms/1000).toFixed(1)+'s'):(ms+'ms');
+return ms>=1000?((ms/1000).toFixed(1)+'秒'):(Math.round(ms)+'毫秒');
 }
 
 async function loadStats(){
@@ -989,6 +987,61 @@ ctx.strokeRect(tx,ty,tw,th);
 ctx.fillStyle='#dde2ee';ctx.textAlign='left';
 lines.forEach((l,i)=>{ctx.fillText(l,tx+9,ty+17+i*15)});
 }
+
+// 礼物详情：悬停展开且可移入选中复制，点击图标钉住，点击空白/Esc/滚动关闭
+let giftPinned=null,giftHideT=null;
+function placePop(g,pop){
+const r=g.getBoundingClientRect();
+const pw=pop.offsetWidth,ph=pop.offsetHeight;
+let left=r.left+r.width/2-pw/2;
+left=Math.max(8,Math.min(left,window.innerWidth-pw-8));
+let top=r.top-ph-8;
+if(top<8) top=Math.min(r.bottom+8,window.innerHeight-ph-8);
+pop.style.left=left+'px';pop.style.top=Math.max(8,top)+'px';
+}
+function showGift(g){
+if(giftHideT){clearTimeout(giftHideT);giftHideT=null}
+document.querySelectorAll('.gift.on').forEach(x=>{if(x!==g)x.classList.remove('on')});
+g.classList.add('on');
+const pop=g.querySelector('.pop');
+if(pop) placePop(g,pop);
+}
+function hideAllGift(){
+if(giftHideT){clearTimeout(giftHideT);giftHideT=null}
+document.querySelectorAll('.gift.on').forEach(x=>x.classList.remove('on'));
+giftPinned=null;
+}
+document.addEventListener('pointerover',e=>{
+const g=e.target.closest?e.target.closest('.gift'):null;
+if(g) showGift(g);
+});
+document.addEventListener('pointerout',e=>{
+const g=e.target.closest?e.target.closest('.gift'):null;
+if(!g) return;
+const to=e.relatedTarget;
+if(to&&g.contains(to)) return;
+if(g===giftPinned) return;
+if(giftHideT) clearTimeout(giftHideT);
+giftHideT=setTimeout(()=>{g.classList.remove('on');giftHideT=null},300);
+});
+document.addEventListener('click',e=>{
+const t=e.target;
+const copy=t.closest?t.closest('.pop-copy'):null;
+if(copy){
+const txt=copy.closest('.pop').getAttribute('data-copy')||'';
+if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(txt)}else{const ta=document.createElement('textarea');ta.value=txt;document.body.appendChild(ta);ta.select();document.execCommand('copy');ta.remove()}
+copy.textContent='已复制';setTimeout(()=>{copy.textContent='复制'},1200);
+return;
+}
+if(t.closest&&t.closest('.pop')) return;
+const g=t.closest?t.closest('.gift'):null;
+if(g){
+if(giftPinned===g){hideAllGift()}else{giftPinned=g;showGift(g)}
+}else{hideAllGift()}
+});
+window.addEventListener('scroll',hideAllGift,true);
+window.addEventListener('resize',hideAllGift);
+document.addEventListener('keydown',e=>{if(e.key==='Escape')hideAllGift()});
 
 function refreshAll(){loadStatus();loadModels();loadStats()}
 
